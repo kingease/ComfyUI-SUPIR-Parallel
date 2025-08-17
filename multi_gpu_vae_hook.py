@@ -178,11 +178,13 @@ class MultiGPUVAEHook(VAEHook):
             tile_batch = torch.cat([tile.to(device) for tile in gpu_tiles], dim=0)
             
             # Move network to this GPU device for processing
-            net_replica = net_replica.to(device)
+            net_replica = self.net.to(device)
+            net_replica.eval()
             
-            # Process the tile batch with multi-GPU sync
-            processed_batch = self.execute_task_queue_on_batch_threaded(
-                tile_batch, task_queue_template, net_replica, gpu_id)
+            # Process the tile batch with multi-GPU sync (no gradients needed)
+            with torch.no_grad():
+                processed_batch = self.execute_task_queue_on_batch_threaded(
+                    tile_batch, task_queue_template, net_replica, gpu_id)
             
             # Process results for each tile in the batch
             for i, (processed_tile, in_bbox, out_bbox, tile_idx) in enumerate(
