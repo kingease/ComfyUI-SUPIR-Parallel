@@ -261,6 +261,8 @@ class SUPIR_first_stage:
                     ], {
                         "default": 'auto'
                     }),
+            "enable_multi_gpu": ("BOOLEAN", {"default": True}),
+            "max_gpus": ("INT", {"default": -1, "min": -1, "max": 8, "step": 1}),
             }
         }
 
@@ -275,7 +277,7 @@ is to fix compression artifacts and such, ends up blurring the image often
 which is expected. Can be replaced with any other denoiser/blur or not used at all.
 """
 
-    def process(self, SUPIR_VAE, image, encoder_dtype, use_tiled_vae, encoder_tile_size, decoder_tile_size):
+    def process(self, SUPIR_VAE, image, encoder_dtype, use_tiled_vae, encoder_tile_size, decoder_tile_size, enable_multi_gpu, max_gpus):
         device = mm.get_torch_device()
         mm.unload_all_models()
         if encoder_dtype == 'auto':
@@ -296,19 +298,45 @@ which is expected. Can be replaced with any other denoiser/blur or not used at a
         dtype = convert_dtype(vae_dtype)
 
         if use_tiled_vae:
+            # Import both single and multi-GPU VAE hooks
             from .SUPIR.utils.tilevae import VAEHook
+            try:
+                from .multi_gpu_vae_hook import create_multi_gpu_vae_hook
+                multi_gpu_available = True
+            except ImportError:
+                multi_gpu_available = False
+                
             # Store the `original_forward` only if it hasn't been stored already
             if not hasattr(SUPIR_VAE.encoder, 'original_forward'):
                 SUPIR_VAE.denoise_encoder.original_forward = SUPIR_VAE.denoise_encoder.forward
                 SUPIR_VAE.decoder.original_forward = SUPIR_VAE.decoder.forward
-                     
-            SUPIR_VAE.denoise_encoder.forward = VAEHook(
-                SUPIR_VAE.denoise_encoder, encoder_tile_size, is_decoder=False, fast_decoder=False,
-                fast_encoder=False, color_fix=False, to_gpu=True)
             
-            SUPIR_VAE.decoder.forward = VAEHook(
-                SUPIR_VAE.decoder, decoder_tile_size // 8, is_decoder=True, fast_decoder=False,
-                fast_encoder=False, color_fix=False, to_gpu=True)
+            # Check if multi-GPU mode should be used
+            available_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+            if max_gpus == -1:
+                num_gpus = available_gpus
+            else:
+                num_gpus = min(max_gpus, available_gpus)
+            use_multi_gpu = enable_multi_gpu and multi_gpu_available and num_gpus > 1
+            
+            if use_multi_gpu:
+                print(f"[SUPIR]: Using Multi-GPU VAE processing with {num_gpus} GPUs")
+                SUPIR_VAE.denoise_encoder.forward = create_multi_gpu_vae_hook(
+                    SUPIR_VAE.denoise_encoder, encoder_tile_size, is_decoder=False, 
+                    fast_decoder=False, fast_encoder=False, color_fix=False, num_gpus=num_gpus)
+                
+                SUPIR_VAE.decoder.forward = create_multi_gpu_vae_hook(
+                    SUPIR_VAE.decoder, decoder_tile_size // 8, is_decoder=True, 
+                    fast_decoder=False, fast_encoder=False, color_fix=False, num_gpus=num_gpus)
+            else:
+                print(f"[SUPIR]: Using Single-GPU VAE processing")
+                SUPIR_VAE.denoise_encoder.forward = VAEHook(
+                    SUPIR_VAE.denoise_encoder, encoder_tile_size, is_decoder=False, fast_decoder=False,
+                    fast_encoder=False, color_fix=False, to_gpu=True)
+                
+                SUPIR_VAE.decoder.forward = VAEHook(
+                    SUPIR_VAE.decoder, decoder_tile_size // 8, is_decoder=True, fast_decoder=False,
+                    fast_encoder=False, color_fix=False, to_gpu=True)
         else:
             # Only assign `original_forward` back if it exists
             if hasattr(SUPIR_VAE.denoise_encoder, 'original_forward'):
