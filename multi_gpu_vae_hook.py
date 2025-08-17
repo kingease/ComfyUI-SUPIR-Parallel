@@ -102,8 +102,11 @@ class SDXLGroupNormSync:
         normalized_batch = []
         for i in range(batch_size):
             tile = tile_batch[i:i+1]  # [1, C, H, W]
+            # Ensure global statistics are on the same device as the tile
+            global_mean = self._global_mean.to(tile.device)
+            global_var = self._global_var.to(tile.device)
             normalized_tile = custom_group_norm(
-                tile, 32, self._global_mean, self._global_var, weight, bias
+                tile, 32, global_mean, global_var, weight, bias
             )
             normalized_batch.append(normalized_tile)
         
