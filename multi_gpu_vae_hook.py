@@ -161,10 +161,7 @@ class MultiGPUVAEHook(VAEHook):
         device = f'cuda:{gpu_id}'
         
         try:
-            # Create a copy of the network for this GPU using deepcopy
-            import copy
-            net_replica = copy.deepcopy(self.net).to(device)
-            net_replica.eval()
+            net_replica = self.net
             
             # Get tiles assigned to this GPU
             gpu_tiles = tile_batches[gpu_id]['tiles']
@@ -177,6 +174,9 @@ class MultiGPUVAEHook(VAEHook):
             
             # Stack tiles into batch: [batch_size, C, H, W]
             tile_batch = torch.stack([tile.to(device) for tile in gpu_tiles], dim=0)
+            
+            # Move network to this GPU device for processing
+            net_replica = net_replica.to(device)
             
             # Process the tile batch with multi-GPU sync
             processed_batch = self.execute_task_queue_on_batch_threaded(
@@ -208,7 +208,7 @@ class MultiGPUVAEHook(VAEHook):
                 'error': str(e),
                 'success': False
             })
-    
+        
     def execute_task_queue_on_batch_threaded(self, tile_batch, task_queue_template, net, gpu_id):
         """Execute task queue on a tile batch with multi-GPU synchronization"""
         device = tile_batch.device
@@ -321,7 +321,7 @@ class MultiGPUVAEHook(VAEHook):
         
         # Create result queue
         result_queue = queue.Queue()
-        
+                
         # Start worker threads - one per GPU
         workers = []
         for gpu_id in self.device_ids:
