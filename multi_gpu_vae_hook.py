@@ -22,7 +22,6 @@ class SDXLGroupNormSync:
         self.sync_counter = 0
         
         # Shared memory for statistics collection (sync GPU threads)
-        self.sync_barrier = threading.Barrier(num_gpus)
         self.stats_lock = threading.Lock()
         self.batch_stats = []  # Stats from each GPU's tile batch
         self.current_sync_id = 0
@@ -40,6 +39,13 @@ class SDXLGroupNormSync:
         Returns normalized tile batch using global statistics
         """
         print(f"[GPU {gpu_id}] Starting group norm sync, sync_id: {self.current_sync_id}")
+        
+        # Create a fresh barrier for this sync point
+        with self.stats_lock:
+            if not hasattr(self, f'_barrier_{self.current_sync_id}'):
+                setattr(self, f'_barrier_{self.current_sync_id}', threading.Barrier(self.num_gpus))
+            current_barrier = getattr(self, f'_barrier_{self.current_sync_id}')
+        
         # 1. Compute batch statistics (aggregate across all tiles in this batch)
         batch_size = tile_batch.shape[0]
         var_list = []
@@ -69,65 +75,68 @@ class SDXLGroupNormSync:
                 'mean': batch_mean.cpu(),
                 'var': batch_var.cpu(), 
                 'pixel_count': total_pixels,
-                'gpu_id': gpu_id
+                'gpu_id': gpu_id,
+                'sync_id': self.current_sync_id
             })
         
         # 4. Wait for ALL GPUs to reach this point
-        print(f"[GPU {gpu_id}] Waiting at first barrier, stats collected: {len(self.batch_stats)}")
-        self.sync_barrier.wait()
-        print(f"[GPU {gpu_id}] Passed first barrier")
+        print(f"[GPU {gpu_id}] Waiting at barrier for sync {self.current_sync_id}, stats collected: {len(self.batch_stats)}")
+        current_barrier.wait()
+        print(f"[GPU {gpu_id}] Passed barrier for sync {self.current_sync_id}")
         
         # 5. Compute global statistics (only one thread does this)
         device = tile_batch.device
         with self.stats_lock:
-            if len(self.batch_stats) == self.num_gpus:
-                # Weighted average across all GPU batches
-                total_pixels_global = sum(stat['pixel_count'] for stat in self.batch_stats)
-                global_weights = [stat['pixel_count'] / total_pixels_global for stat in self.batch_stats]
+            # Filter stats for current sync point only
+            current_sync_stats = [stat for stat in self.batch_stats if stat['sync_id'] == self.current_sync_id]
+            if len(current_sync_stats) == self.num_gpus:
+                # Weighted average across all GPU batches for this sync point
+                total_pixels_global = sum(stat['pixel_count'] for stat in current_sync_stats)
+                global_weights = [stat['pixel_count'] / total_pixels_global for stat in current_sync_stats]
                 
                 # Move all stats to current device before computation
-                global_mean = torch.zeros_like(self.batch_stats[0]['mean']).to(device)
-                global_var = torch.zeros_like(self.batch_stats[0]['var']).to(device)
+                global_mean = torch.zeros_like(current_sync_stats[0]['mean']).to(device)
+                global_var = torch.zeros_like(current_sync_stats[0]['var']).to(device)
                 
-                for w, stat in zip(global_weights, self.batch_stats):
+                for w, stat in zip(global_weights, current_sync_stats):
                     global_mean += w * stat['mean'].to(device)
                     global_var += w * stat['var'].to(device)
                 
-                # Store for other threads
-                self._global_mean = global_mean
-                self._global_var = global_var
+                # Store for other threads with sync_id
+                setattr(self, f'_global_mean_{self.current_sync_id}', global_mean)
+                setattr(self, f'_global_var_{self.current_sync_id}', global_var)
         
         # 6. All threads use the computed global statistics
         weight = norm_layer.weight.to(device) if hasattr(norm_layer, 'weight') and norm_layer.weight is not None else None
         bias = norm_layer.bias.to(device) if hasattr(norm_layer, 'bias') and norm_layer.bias is not None else None
+        
+        # Get global statistics for this sync point
+        global_mean = getattr(self, f'_global_mean_{self.current_sync_id}')
+        global_var = getattr(self, f'_global_var_{self.current_sync_id}')
         
         # Apply group norm to entire batch
         normalized_batch = []
         for i in range(batch_size):
             tile = tile_batch[i:i+1]  # [1, C, H, W]
             # Ensure global statistics are on the same device as the tile
-            global_mean = self._global_mean.to(tile.device)
-            global_var = self._global_var.to(tile.device)
+            tile_global_mean = global_mean.to(tile.device)
+            tile_global_var = global_var.to(tile.device)
             normalized_tile = custom_group_norm(
-                tile, 32, global_mean, global_var, weight, bias
+                tile, 32, tile_global_mean, tile_global_var, weight, bias
             )
             normalized_batch.append(normalized_tile)
         
         normalized_tile_batch = torch.cat(normalized_batch, dim=0)  # [batch_size, C, H, W]
         
-        # 7. Reset for next sync point (first GPU to finish resets)
-        try:
-            print(f"[GPU {gpu_id}] Waiting at second barrier")
-            self.sync_barrier.wait()
-            print(f"[GPU {gpu_id}] Passed second barrier")
-            # Thread-safe reset - only first GPU to reach here resets
-            with self.stats_lock:
-                if len(self.batch_stats) == self.num_gpus:
-                    print(f"[GPU {gpu_id}] Resetting for next sync point")
-                    self.reset_for_sync_point()
-        except threading.BrokenBarrierError:
-            print(f"[GPU {gpu_id}] Barrier broken error caught")
-            pass
+        # 7. Prepare for next sync point
+        with self.stats_lock:
+            # Remove stats for this sync point to avoid accumulation
+            self.batch_stats = [stat for stat in self.batch_stats if stat['sync_id'] != self.current_sync_id]
+            # Only advance sync_id once per sync point
+            if not hasattr(self, f'_advanced_{self.current_sync_id}'):
+                setattr(self, f'_advanced_{self.current_sync_id}', True)
+                self.current_sync_id += 1
+                print(f"[GPU {gpu_id}] Advanced to sync_id {self.current_sync_id}")
         
         return normalized_tile_batch
 
