@@ -157,7 +157,7 @@ class MultiGPUVAEHook(VAEHook):
         finally:
             self.net.to(original_device)
     
-    def gpu_worker(self, gpu_id, tile_batches, result_queue, task_queue_template):
+    def gpu_worker(self, gpu_id, tile_batches, result_queue, task_queue_template, gpu_network):
         """Worker function that processes tile batches on a specific GPU"""
         device = f'cuda:{gpu_id}'
         
@@ -177,9 +177,8 @@ class MultiGPUVAEHook(VAEHook):
             # Each tile: [1, C, H, W] -> concat -> [num_tiles, C, H, W]
             tile_batch = torch.cat([tile.to(device) for tile in gpu_tiles], dim=0)
             
-            # Move network to this GPU device for processing
-            net_replica = self.net.to(device)
-            net_replica.eval()
+            # Use the pre-loaded network for this GPU
+            net_replica = gpu_network
             
             # Process the tile batch with multi-GPU sync (no gradients needed)
             with torch.no_grad():
@@ -323,6 +322,16 @@ class MultiGPUVAEHook(VAEHook):
         # BATCH ALLOCATION: Distribute tiles across GPUs
         tile_batches = self.allocate_tiles_to_gpus(tiles, in_bboxes, out_bboxes, num_tiles)
         
+        # PRE-LOAD MODELS: Create network replicas on each GPU before starting workers
+        print("[Multi-GPU VAE]: Pre-loading models on all GPUs...")
+        gpu_networks = {}
+        for gpu_id in self.device_ids:
+            device = f'cuda:{gpu_id}'
+            # Clone the entire model for each GPU
+            import copy
+            gpu_networks[gpu_id] = copy.deepcopy(self.net).to(device).eval()
+            print(f"[Multi-GPU VAE]: Model loaded on GPU {gpu_id}")
+        
         # Create result queue
         result_queue = queue.Queue()
                 
@@ -331,7 +340,7 @@ class MultiGPUVAEHook(VAEHook):
         for gpu_id in self.device_ids:
             worker = threading.Thread(
                 target=self.gpu_worker,
-                args=(gpu_id, tile_batches, result_queue, single_task_queue)
+                args=(gpu_id, tile_batches, result_queue, single_task_queue, gpu_networks[gpu_id])
             )
             worker.start()
             workers.append(worker)
