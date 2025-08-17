@@ -39,6 +39,7 @@ class SDXLGroupNormSync:
         tile_batch shape: [batch_size, C, H, W] where batch_size = tiles per GPU
         Returns normalized tile batch using global statistics
         """
+        print(f"[GPU {gpu_id}] Starting group norm sync, sync_id: {self.current_sync_id}")
         # 1. Compute batch statistics (aggregate across all tiles in this batch)
         batch_size = tile_batch.shape[0]
         var_list = []
@@ -72,7 +73,9 @@ class SDXLGroupNormSync:
             })
         
         # 4. Wait for ALL GPUs to reach this point
+        print(f"[GPU {gpu_id}] Waiting at first barrier, stats collected: {len(self.batch_stats)}")
         self.sync_barrier.wait()
+        print(f"[GPU {gpu_id}] Passed first barrier")
         
         # 5. Compute global statistics (only one thread does this)
         device = tile_batch.device
@@ -114,12 +117,16 @@ class SDXLGroupNormSync:
         
         # 7. Reset for next sync point (first GPU to finish resets)
         try:
+            print(f"[GPU {gpu_id}] Waiting at second barrier")
             self.sync_barrier.wait()
+            print(f"[GPU {gpu_id}] Passed second barrier")
             # Thread-safe reset - only first GPU to reach here resets
             with self.stats_lock:
                 if len(self.batch_stats) == self.num_gpus:
+                    print(f"[GPU {gpu_id}] Resetting for next sync point")
                     self.reset_for_sync_point()
         except threading.BrokenBarrierError:
+            print(f"[GPU {gpu_id}] Barrier broken error caught")
             pass
         
         return normalized_tile_batch
@@ -227,13 +234,20 @@ class MultiGPUVAEHook(VAEHook):
         device = tile_batch.device
         task_queue = clone_task_queue(task_queue_template)
         
+        sync_count = 0
+        total_tasks = len(task_queue)
+        print(f"[GPU {gpu_id}] Starting task queue execution with {total_tasks} tasks")
+        
         while len(task_queue) > 0:
             task = task_queue.pop(0)
             
             if task[0] == 'pre_norm':
                 # CRITICAL: Multi-GPU Group Norm Synchronization on batch
+                sync_count += 1
+                print(f"[GPU {gpu_id}] Executing sync point {sync_count}")
                 tile_batch = self.group_norm_sync.collect_and_sync_group_norm_batch(
                     tile_batch, task[1], gpu_id)
+                print(f"[GPU {gpu_id}] Completed sync point {sync_count}")
                 
             elif task[0] == 'store_res' or task[0] == 'store_res_cpu':
                 # Store residual connection (apply to batch)
@@ -261,6 +275,7 @@ class MultiGPUVAEHook(VAEHook):
                 # Regular operations: conv, silu, etc. (apply to batch)
                 tile_batch = task[1](tile_batch)
         
+        print(f"[GPU {gpu_id}] Completed task queue execution with {sync_count} sync points")
         return tile_batch
     
     def multi_gpu_vae_tile_forward(self, z):
@@ -371,7 +386,7 @@ class MultiGPUVAEHook(VAEHook):
         
         while completed_tiles < num_tiles:
             try:
-                tile_result = result_queue.get(timeout=10.0)
+                tile_result = result_queue.get(timeout=30.0)
                 
                 if tile_result['success']:
                     out_bbox = tile_result['out_bbox']
@@ -384,7 +399,10 @@ class MultiGPUVAEHook(VAEHook):
                     print(f"Error processing tile: {tile_result.get('error', 'Unknown error')}")
                     
             except queue.Empty:
-                print("Timeout waiting for tile results")
+                print(f"Timeout waiting for tile results. Completed: {completed_tiles}/{num_tiles}")
+                print("Checking worker status...")
+                for i, worker in enumerate(workers):
+                    print(f"Worker {i} alive: {worker.is_alive()}")
                 break
         
         pbar.close()
