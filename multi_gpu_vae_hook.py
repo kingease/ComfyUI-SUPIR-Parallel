@@ -156,15 +156,14 @@ class MultiGPUVAEHook(VAEHook):
         finally:
             self.net.to(original_device)
     
-    def gpu_worker(self, gpu_id, tile_batches, result_queue, task_queue_template, net_state_dict):
+    def gpu_worker(self, gpu_id, tile_batches, result_queue, task_queue_template):
         """Worker function that processes tile batches on a specific GPU"""
         device = f'cuda:{gpu_id}'
         
         try:
-            # Create a replica of the network on this GPU
-            net_replica = type(self.net)()
-            net_replica.load_state_dict(net_state_dict)
-            net_replica = net_replica.to(device)
+            # Create a copy of the network for this GPU using deepcopy
+            import copy
+            net_replica = copy.deepcopy(self.net).to(device)
             net_replica.eval()
             
             # Get tiles assigned to this GPU
@@ -323,15 +322,12 @@ class MultiGPUVAEHook(VAEHook):
         # Create result queue
         result_queue = queue.Queue()
         
-        # Get network state dict for replication
-        net_state_dict = self.net.state_dict()
-        
         # Start worker threads - one per GPU
         workers = []
         for gpu_id in self.device_ids:
             worker = threading.Thread(
                 target=self.gpu_worker,
-                args=(gpu_id, tile_batches, result_queue, single_task_queue, net_state_dict)
+                args=(gpu_id, tile_batches, result_queue, single_task_queue)
             )
             worker.start()
             workers.append(worker)
