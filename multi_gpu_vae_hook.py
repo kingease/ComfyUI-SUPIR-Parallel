@@ -322,15 +322,25 @@ class MultiGPUVAEHook(VAEHook):
         # BATCH ALLOCATION: Distribute tiles across GPUs
         tile_batches = self.allocate_tiles_to_gpus(tiles, in_bboxes, out_bboxes, num_tiles)
         
-        # PRE-LOAD MODELS: Create network replicas on each GPU before starting workers
+        # PRE-LOAD MODELS: Create clean network replicas without threading locks
         print("[Multi-GPU VAE]: Pre-loading models on all GPUs...")
         gpu_networks = {}
+        
+        # Save original forward method and temporarily restore it for copying
+        if hasattr(self.net, 'original_forward'):
+            temp_forward = self.net.forward
+            self.net.forward = self.net.original_forward
+        
         for gpu_id in self.device_ids:
             device = f'cuda:{gpu_id}'
-            # Clone the entire model for each GPU
+            # Now we can safely deepcopy the network without threading locks
             import copy
             gpu_networks[gpu_id] = copy.deepcopy(self.net).to(device).eval()
             print(f"[Multi-GPU VAE]: Model loaded on GPU {gpu_id}")
+        
+        # Restore our hooked forward method
+        if hasattr(self.net, 'original_forward'):
+            self.net.forward = temp_forward
         
         # Create result queue
         result_queue = queue.Queue()
