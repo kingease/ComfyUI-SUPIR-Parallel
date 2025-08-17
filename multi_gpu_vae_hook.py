@@ -8,6 +8,7 @@ from .SUPIR.utils.tilevae import VAEHook, GroupNormParam, clone_task_queue, buil
 import gc
 from tqdm import tqdm
 import comfy.utils
+from einops import rearrange
 
 
 class SDXLGroupNormSync:
@@ -172,8 +173,9 @@ class MultiGPUVAEHook(VAEHook):
             if len(gpu_tiles) == 0:
                 return  # No tiles for this GPU
             
-            # Stack tiles into batch: [batch_size, C, H, W]
-            tile_batch = torch.stack([tile.to(device) for tile in gpu_tiles], dim=0)
+            # Concatenate tiles into batch: [batch_size, C, H, W]
+            # Each tile: [1, C, H, W] -> concat -> [num_tiles, C, H, W]
+            tile_batch = torch.cat([tile.to(device) for tile in gpu_tiles], dim=0)
             
             # Move network to this GPU device for processing
             net_replica = net_replica.to(device)
