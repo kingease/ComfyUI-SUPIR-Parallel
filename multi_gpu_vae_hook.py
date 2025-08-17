@@ -75,24 +75,28 @@ class SDXLGroupNormSync:
         self.sync_barrier.wait()
         
         # 5. Compute global statistics (only one thread does this)
+        device = tile_batch.device
         with self.stats_lock:
             if len(self.batch_stats) == self.num_gpus:
                 # Weighted average across all GPU batches
                 total_pixels_global = sum(stat['pixel_count'] for stat in self.batch_stats)
                 global_weights = [stat['pixel_count'] / total_pixels_global for stat in self.batch_stats]
                 
-                global_mean = sum(w * stat['mean'].to(tile_batch.device) 
-                                for w, stat in zip(global_weights, self.batch_stats))
-                global_var = sum(w * stat['var'].to(tile_batch.device)
-                               for w, stat in zip(global_weights, self.batch_stats))
+                # Move all stats to current device before computation
+                global_mean = torch.zeros_like(self.batch_stats[0]['mean']).to(device)
+                global_var = torch.zeros_like(self.batch_stats[0]['var']).to(device)
+                
+                for w, stat in zip(global_weights, self.batch_stats):
+                    global_mean += w * stat['mean'].to(device)
+                    global_var += w * stat['var'].to(device)
                 
                 # Store for other threads
                 self._global_mean = global_mean
                 self._global_var = global_var
         
         # 6. All threads use the computed global statistics
-        weight = norm_layer.weight if hasattr(norm_layer, 'weight') else None
-        bias = norm_layer.bias if hasattr(norm_layer, 'bias') else None
+        weight = norm_layer.weight.to(device) if hasattr(norm_layer, 'weight') and norm_layer.weight is not None else None
+        bias = norm_layer.bias.to(device) if hasattr(norm_layer, 'bias') and norm_layer.bias is not None else None
         
         # Apply group norm to entire batch
         normalized_batch = []
