@@ -209,6 +209,9 @@ class MultiGPUVAEHook(VAEHook):
             torch.cuda.empty_cache()
                     
         except Exception as e:
+            import traceback
+            print(f"[GPU {gpu_id}] FULL TRACEBACK:")
+            print(traceback.format_exc())
             print(f"GPU worker {gpu_id} failed: {e}")
             result_queue.put({
                 'tile_idx': -1,
