@@ -159,13 +159,14 @@ class DistributedVAEHook(VAEHook):
             
             del downsampled_z, z_device
         
-        # Prepare data for multiprocessing without shared memory
+        # Prepare data for multiprocessing - only CPU/serializable data
         input_data = {
             'z_shape': z.shape,
             'z_dtype': z.dtype,
             'in_bboxes': in_bboxes,
             'out_bboxes': out_bboxes,
-            'task_queue': single_task_queue
+            'task_queue': single_task_queue,
+            'z_cpu': z.cpu()  # Move to CPU for safe serialization
         }
         
         # Setup distributed environment
@@ -177,14 +178,12 @@ class DistributedVAEHook(VAEHook):
                        height * 8 if self.is_decoder else height // 8, 
                        width * 8 if self.is_decoder else width // 8)
         
-        # Put input tensor on GPU 0 
-        z_gpu0 = z.to('cuda:0')
-        
         if self.num_gpus == 1:
             # Single GPU case - no distributed processing needed
             return super().vae_tile_forward(z)
         
         # Spawn worker processes for ranks 1, 2, 3... (main process = rank 0)
+        # NO CUDA tensors in args - only CPU data
         if self.num_gpus > 1:
             ctx = mp.spawn(
                 self.distributed_worker_nccl,
@@ -194,7 +193,7 @@ class DistributedVAEHook(VAEHook):
             )
         
         # Main process executes rank 0 logic
-        result = self.execute_rank_0_processing(z_gpu0, input_data, result_shape)
+        result = self.execute_rank_0_processing(input_data, result_shape)
         
         # Wait for worker processes to complete
         if self.num_gpus > 1:
@@ -219,7 +218,7 @@ class DistributedVAEHook(VAEHook):
         torch.cuda.set_device(actual_rank)
         
         try:
-            # Receive input tensor via NCCL broadcast from rank 0 (main process)
+            # Extract serializable data (no CUDA tensors here)
             z_shape = input_data['z_shape']
             z_dtype = input_data['z_dtype']
             in_bboxes = input_data['in_bboxes']
@@ -282,7 +281,7 @@ class DistributedVAEHook(VAEHook):
         finally:
             dist.destroy_process_group()
     
-    def execute_rank_0_processing(self, z_gpu0, input_data, result_shape):
+    def execute_rank_0_processing(self, input_data, result_shape):
         """Main process executes as rank 0 in distributed group"""
         # Initialize distributed environment as rank 0
         dist.init_process_group(
@@ -301,8 +300,10 @@ class DistributedVAEHook(VAEHook):
             in_bboxes = input_data['in_bboxes']
             out_bboxes = input_data['out_bboxes']
             task_queue_template = input_data['task_queue']
+            z_cpu = input_data['z_cpu']
             
-            # Broadcast input tensor to all ranks
+            # Move input to GPU 0 and broadcast to all ranks
+            z_gpu0 = z_cpu.to('cuda:0')
             dist.broadcast(z_gpu0, src=0)
             
             # Load model replica on GPU 0
@@ -431,12 +432,14 @@ class DistributedVAEHook(VAEHook):
     def allocate_tiles_to_processes(self, tiles, in_bboxes, out_bboxes):
         """Allocate tiles to processes in round-robin fashion"""
         tile_batches = [[] for _ in range(self.num_gpus)]
+        bbox_batches = [[] for _ in range(self.num_gpus)]
         
-        for i, tile in enumerate(tiles):
+        for i, (tile, in_bbox, out_bbox) in enumerate(zip(tiles, in_bboxes, out_bboxes)):
             process_id = i % self.num_gpus
             tile_batches[process_id].append(tile)
+            bbox_batches[process_id].append((in_bbox, out_bbox))
         
-        return tile_batches
+        return tile_batches, bbox_batches
 
 
 
