@@ -159,14 +159,14 @@ class DistributedVAEHook(VAEHook):
             
             del downsampled_z, z_device
         
-        # Prepare data for multiprocessing - only CPU/serializable data
+        # Prepare data for multiprocessing - only small serializable data
         input_data = {
             'z_shape': z.shape,
             'z_dtype': z.dtype,
             'in_bboxes': in_bboxes,
             'out_bboxes': out_bboxes,
-            'task_queue': single_task_queue,
-            'z_cpu': z.cpu()  # Move to CPU for safe serialization
+            'is_decoder': self.is_decoder
+            # No task_queue or z_cpu - build locally in each process
         }
         
         # Setup distributed environment
@@ -192,8 +192,8 @@ class DistributedVAEHook(VAEHook):
                 join=False  # Don't block main process
             )
         
-        # Main process executes rank 0 logic
-        result = self.execute_rank_0_processing(input_data, result_shape)
+        # Main process executes rank 0 logic  
+        result = self.execute_rank_0_processing(z, input_data, result_shape)
         
         # Wait for worker processes to complete
         if self.num_gpus > 1:
@@ -223,7 +223,7 @@ class DistributedVAEHook(VAEHook):
             z_dtype = input_data['z_dtype']
             in_bboxes = input_data['in_bboxes']
             out_bboxes = input_data['out_bboxes']
-            task_queue_template = input_data['task_queue']
+            is_decoder = input_data['is_decoder']
             
             # Create local tensor to receive broadcast from rank 0
             z_local = torch.zeros(z_shape, dtype=z_dtype, device=device)
@@ -234,6 +234,9 @@ class DistributedVAEHook(VAEHook):
             # Load model replica on this GPU
             import copy
             net_replica = copy.deepcopy(self.net).to(device).eval()
+            
+            # Build task queue locally in this process
+            task_queue_template = build_task_queue(net_replica, is_decoder)
             
             # Distribute tiles to this process (using actual_rank for distribution)
             tiles_for_rank = []
@@ -281,7 +284,7 @@ class DistributedVAEHook(VAEHook):
         finally:
             dist.destroy_process_group()
     
-    def execute_rank_0_processing(self, input_data, result_shape):
+    def execute_rank_0_processing(self, z, input_data, result_shape):
         """Main process executes as rank 0 in distributed group"""
         # Initialize distributed environment as rank 0
         dist.init_process_group(
@@ -299,12 +302,14 @@ class DistributedVAEHook(VAEHook):
             z_dtype = input_data['z_dtype']
             in_bboxes = input_data['in_bboxes']
             out_bboxes = input_data['out_bboxes']
-            task_queue_template = input_data['task_queue']
-            z_cpu = input_data['z_cpu']
+            is_decoder = input_data['is_decoder']
             
             # Move input to GPU 0 and broadcast to all ranks
-            z_gpu0 = z_cpu.to('cuda:0')
+            z_gpu0 = z.to('cuda:0')  # Use original z instead of z_cpu
             dist.broadcast(z_gpu0, src=0)
+            
+            # Build task queue locally in rank 0
+            task_queue_template = build_task_queue(net_replica, is_decoder)
             
             # Load model replica on GPU 0
             import copy
