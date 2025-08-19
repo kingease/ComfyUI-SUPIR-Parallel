@@ -195,11 +195,11 @@ class DistributedVAEHook(VAEHook):
         print("========2")
         # Main process executes rank 0 logic  
         result = self.execute_rank_0_processing(z, input_data, result_shape)
-        
+        print("========3")
         # Wait for worker processes to complete
         if self.num_gpus > 1:
             ctx.join()
-        
+        print("========4")
         return result.to(z.device)
 
     def distributed_worker_nccl(self, rank, world_size, input_data):
