@@ -184,6 +184,7 @@ class DistributedVAEHook(VAEHook):
         
         # Spawn worker processes for ranks 1, 2, 3... (main process = rank 0)
         # NO CUDA tensors in args - only CPU data
+        print("========1")
         if self.num_gpus > 1:
             ctx = mp.spawn(
                 self.distributed_worker_nccl,
@@ -191,7 +192,7 @@ class DistributedVAEHook(VAEHook):
                 nprocs=self.num_gpus - 1,  # Main process handles rank 0
                 join=False  # Don't block main process
             )
-        
+        print("========2")
         # Main process executes rank 0 logic  
         result = self.execute_rank_0_processing(z, input_data, result_shape)
         
