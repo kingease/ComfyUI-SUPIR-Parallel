@@ -217,7 +217,7 @@ class DistributedVAEHook(VAEHook):
         
         device = f'cuda:{actual_rank}'
         torch.cuda.set_device(actual_rank)
-        
+        print(f'--------{rank}-----------')
         try:
             # Extract serializable data (no CUDA tensors here)
             z_shape = input_data['z_shape']
