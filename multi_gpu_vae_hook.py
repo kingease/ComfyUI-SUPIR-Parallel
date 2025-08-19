@@ -127,7 +127,7 @@ class DistributedVAEHook(VAEHook):
             self.net.to(original_device)
     
     def distributed_vae_forward(self, z):
-        """Main distributed VAE forward pass using multiprocessing"""
+        """Main distributed VAE forward pass using NCCL broadcast"""
         dtype = z.dtype
         N, height, width = z.shape[0], z.shape[2], z.shape[3]
         
@@ -137,14 +137,7 @@ class DistributedVAEHook(VAEHook):
         in_bboxes, out_bboxes = self.split_tiles(height, width)
         num_tiles = len(in_bboxes)
         
-        print(f"[Distributed VAE]: Processing {num_tiles} tiles across {self.num_gpus} processes")
-        
-        # Prepare tiles and save to shared memory
-        tiles = []
-        for input_bbox in in_bboxes:
-            tile = z[:, :, input_bbox[2]:input_bbox[3], input_bbox[0]:input_bbox[1]]
-            tile = tile.share_memory_()  # Share memory for multiprocessing
-            tiles.append(tile)
+        print(f"[Distributed VAE]: Processing {num_tiles} tiles across {self.num_gpus} GPUs")
         
         # Build task queue
         single_task_queue = build_task_queue(self.net, self.is_decoder)
@@ -166,84 +159,193 @@ class DistributedVAEHook(VAEHook):
             
             del downsampled_z, z_device
         
-        del z  # Free input memory
+        # Prepare data for multiprocessing without shared memory
+        input_data = {
+            'z_shape': z.shape,
+            'z_dtype': z.dtype,
+            'in_bboxes': in_bboxes,
+            'out_bboxes': out_bboxes,
+            'task_queue': single_task_queue
+        }
         
-        # Allocate tiles to processes
-        tile_batches = self.allocate_tiles_to_processes(tiles, in_bboxes, out_bboxes)
-        
-        # Initialize result tensor in shared memory
-        result = torch.zeros(
-            (N, tiles[0].shape[1], 
-             height * 8 if self.is_decoder else height // 8, 
-             width * 8 if self.is_decoder else width // 8), 
-            dtype=dtype
-        ).share_memory_()
-        
-        # Setup distributed training
+        # Setup distributed environment
         os.environ['MASTER_ADDR'] = 'localhost'
         os.environ['MASTER_PORT'] = '12355'
         
-        # Spawn processes
-        mp.spawn(
-            self.distributed_worker,
-            args=(self.num_gpus, tile_batches, result, out_bboxes, single_task_queue),
-            nprocs=self.num_gpus,
-            join=True
-        )
+        # Create result tensor shape
+        result_shape = (z.shape[0], z.shape[1], 
+                       height * 8 if self.is_decoder else height // 8, 
+                       width * 8 if self.is_decoder else width // 8)
         
-        return result.to(dtype)
+        # Put input tensor on GPU 0 
+        z_gpu0 = z.to('cuda:0')
+        
+        if self.num_gpus == 1:
+            # Single GPU case - no distributed processing needed
+            return super().vae_tile_forward(z)
+        
+        # Spawn worker processes for ranks 1, 2, 3... (main process = rank 0)
+        if self.num_gpus > 1:
+            ctx = mp.spawn(
+                self.distributed_worker_nccl,
+                args=(self.num_gpus, input_data),
+                nprocs=self.num_gpus - 1,  # Main process handles rank 0
+                join=False  # Don't block main process
+            )
+        
+        # Main process executes rank 0 logic
+        result = self.execute_rank_0_processing(z_gpu0, input_data, result_shape)
+        
+        # Wait for worker processes to complete
+        if self.num_gpus > 1:
+            ctx.join()
+        
+        return result.to(z.device)
 
-    def distributed_worker(self, rank, world_size, tile_batches, result, out_bboxes, task_queue_template):
-        """Distributed worker process for GPU processing"""
+    def distributed_worker_nccl(self, rank, world_size, input_data):
+        """Distributed worker for ranks 1, 2, 3... (rank 0 = main process)"""
+        # Adjust rank since main process is rank 0, spawned processes are rank 1,2,3...
+        actual_rank = rank + 1
+        
         # Initialize distributed environment
         dist.init_process_group(
             backend='nccl',
             init_method='env://',
-            rank=rank,
+            rank=actual_rank,
             world_size=world_size
         )
         
-        device = f'cuda:{rank}'
-        torch.cuda.set_device(rank)
+        device = f'cuda:{actual_rank}'
+        torch.cuda.set_device(actual_rank)
         
         try:
-            # Load model on this GPU
+            # Receive input tensor via NCCL broadcast from rank 0 (main process)
+            z_shape = input_data['z_shape']
+            z_dtype = input_data['z_dtype']
+            in_bboxes = input_data['in_bboxes']
+            out_bboxes = input_data['out_bboxes']
+            task_queue_template = input_data['task_queue']
+            
+            # Create local tensor to receive broadcast from rank 0
+            z_local = torch.zeros(z_shape, dtype=z_dtype, device=device)
+            
+            # Broadcast input tensor from rank 0 to all ranks
+            dist.broadcast(z_local, src=0)
+            
+            # Load model replica on this GPU
             import copy
             net_replica = copy.deepcopy(self.net).to(device).eval()
             
-            # Get tiles for this process
-            process_tiles = tile_batches[rank]
-            if len(process_tiles) == 0:
+            # Distribute tiles to this process (using actual_rank for distribution)
+            tiles_for_rank = []
+            bboxes_for_rank = []
+            
+            for i, (in_bbox, out_bbox) in enumerate(zip(in_bboxes, out_bboxes)):
+                if i % world_size == actual_rank:  # Round-robin distribution
+                    tile = z_local[:, :, in_bbox[2]:in_bbox[3], in_bbox[0]:in_bbox[1]]
+                    tiles_for_rank.append(tile)
+                    bboxes_for_rank.append((in_bbox, out_bbox))
+            
+            if len(tiles_for_rank) == 0:
                 return
             
-            # Create distributed sync
-            group_norm_sync = DistributedGroupNormSync(rank, world_size)
+            # Create distributed sync for group norm
+            group_norm_sync = DistributedGroupNormSync(actual_rank, world_size)
             
-            # Process tiles
-            for tile_idx, tile in enumerate(process_tiles):
-                tile_tensor = tile.to(device)
-                
-                # Process with distributed sync
+            # Initialize result tensor on this GPU
+            result_shape = (z_shape[0], z_shape[1], 
+                           z_shape[2] * 8 if self.is_decoder else z_shape[2] // 8, 
+                           z_shape[3] * 8 if self.is_decoder else z_shape[3] // 8)
+            local_result = torch.zeros(result_shape, dtype=z_dtype, device=device)
+            
+            # Process assigned tiles and write to local result
+            for tile, (in_bbox, out_bbox) in zip(tiles_for_rank, bboxes_for_rank):
                 processed_tile = self.execute_distributed_task_queue(
-                    tile_tensor.unsqueeze(0), task_queue_template, net_replica, group_norm_sync
+                    tile.unsqueeze(0), task_queue_template, net_replica, group_norm_sync
                 )
                 
-                # Get original tile index
-                original_idx = rank + tile_idx * world_size
-                if original_idx < len(out_bboxes):
-                    out_bbox = out_bboxes[original_idx]
-                    processed_tile = crop_valid_region(
-                        processed_tile, None, out_bbox, self.is_decoder
-                    ).squeeze(0)
-                    
-                    # Write to result
-                    result[:, :, out_bbox[2]:out_bbox[3], out_bbox[0]:out_bbox[1]] = processed_tile.cpu()
+                processed_tile = crop_valid_region(
+                    processed_tile, None, out_bbox, self.is_decoder
+                ).squeeze(0)
+                
+                # Write to local result tensor
+                local_result[:, :, out_bbox[2]:out_bbox[3], out_bbox[0]:out_bbox[1]] = processed_tile
+            
+            # Use NCCL reduce to send result to rank 0 (main process)
+            dist.reduce(local_result, dst=0, op=dist.ReduceOp.SUM)
                     
             torch.cuda.empty_cache()
             
         except Exception as e:
             print(f"[Process {rank}] Error: {e}")
             raise
+        finally:
+            dist.destroy_process_group()
+    
+    def execute_rank_0_processing(self, z_gpu0, input_data, result_shape):
+        """Main process executes as rank 0 in distributed group"""
+        # Initialize distributed environment as rank 0
+        dist.init_process_group(
+            backend='nccl',
+            init_method='env://',
+            rank=0,
+            world_size=self.num_gpus
+        )
+        
+        torch.cuda.set_device(0)
+        
+        try:
+            # Extract data
+            z_shape = input_data['z_shape']
+            z_dtype = input_data['z_dtype']
+            in_bboxes = input_data['in_bboxes']
+            out_bboxes = input_data['out_bboxes']
+            task_queue_template = input_data['task_queue']
+            
+            # Broadcast input tensor to all ranks
+            dist.broadcast(z_gpu0, src=0)
+            
+            # Load model replica on GPU 0
+            import copy
+            net_replica = copy.deepcopy(self.net).to('cuda:0').eval()
+            
+            # Distribute tiles to rank 0
+            tiles_for_rank0 = []
+            bboxes_for_rank0 = []
+            
+            for i, (in_bbox, out_bbox) in enumerate(zip(in_bboxes, out_bboxes)):
+                if i % self.num_gpus == 0:  # Rank 0 gets tiles 0, num_gpus, 2*num_gpus, ...
+                    tile = z_gpu0[:, :, in_bbox[2]:in_bbox[3], in_bbox[0]:in_bbox[1]]
+                    tiles_for_rank0.append(tile)
+                    bboxes_for_rank0.append((in_bbox, out_bbox))
+            
+            # Create distributed sync for group norm
+            group_norm_sync = DistributedGroupNormSync(0, self.num_gpus)
+            
+            # Initialize result tensor on GPU 0
+            result = torch.zeros(result_shape, dtype=z_dtype, device='cuda:0')
+            
+            # Process rank 0's assigned tiles
+            for tile, (in_bbox, out_bbox) in zip(tiles_for_rank0, bboxes_for_rank0):
+                processed_tile = self.execute_distributed_task_queue(
+                    tile.unsqueeze(0), task_queue_template, net_replica, group_norm_sync
+                )
+                
+                processed_tile = crop_valid_region(
+                    processed_tile, None, out_bbox, self.is_decoder
+                ).squeeze(0)
+                
+                # Write to result tensor
+                result[:, :, out_bbox[2]:out_bbox[3], out_bbox[0]:out_bbox[1]] = processed_tile
+            
+            # Receive results from other ranks via NCCL reduce
+            # The reduce operation will sum all local_result tensors to rank 0
+            # Since each rank writes to different regions, SUM effectively combines them
+            dist.reduce(result, dst=0, op=dist.ReduceOp.SUM)
+            
+            torch.cuda.empty_cache()
+            return result
+            
         finally:
             dist.destroy_process_group()
 
