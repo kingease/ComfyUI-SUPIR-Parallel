@@ -1,7 +1,8 @@
 import torch
-import threading
-import queue
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import math
+import os
 from typing import List, Tuple, Dict
 import comfy.model_management as mm
 from .SUPIR.utils.tilevae import VAEHook, GroupNormParam, clone_task_queue, build_task_queue, crop_valid_region, get_var_mean, custom_group_norm
@@ -11,43 +12,25 @@ import comfy.utils
 from einops import rearrange
 
 
-class SDXLGroupNormSync:
+class DistributedGroupNormSync:
     """
-    Lightweight synchronization for SDXL VAE Group Normalization
-    Handles exactly 17 sync points for encoder + 17 for decoder = 34 total
-    OPTIMIZED: Each GPU processes tile batches, sync across GPU threads only
+    Distributed synchronization for SDXL VAE Group Normalization
+    Uses PyTorch distributed collective operations for efficient GPU communication
     """
-    def __init__(self, num_gpus: int):
-        self.num_gpus = num_gpus
-        self.sync_counter = 0
+    def __init__(self, rank: int, world_size: int):
+        self.rank = rank
+        self.world_size = world_size
         
-        # Shared memory for statistics collection (sync GPU threads)
-        self.stats_lock = threading.Lock()
-        self.batch_stats = []  # Stats from each GPU's tile batch
-        self.current_sync_id = 0
-        
-    def reset_for_sync_point(self):
-        """Reset for a new synchronization point"""
-        with self.stats_lock:
-            self.batch_stats.clear()
-            self.current_sync_id += 1
-    
-    def collect_and_sync_group_norm_batch(self, tile_batch: torch.Tensor, norm_layer, gpu_id: int):
+    def collect_and_sync_group_norm_batch(self, tile_batch: torch.Tensor, norm_layer):
         """
-        Collect group norm statistics from tile batch and synchronize across GPUs
+        Collect group norm statistics from tile batch and synchronize across all processes
         tile_batch shape: [batch_size, C, H, W] where batch_size = tiles per GPU
         Returns normalized tile batch using global statistics
         """
-        print(f"[GPU {gpu_id}] Starting group norm sync, sync_id: {self.current_sync_id}")
-        
-        # Create a fresh barrier for this sync point
-        with self.stats_lock:
-            if not hasattr(self, f'_barrier_{self.current_sync_id}'):
-                setattr(self, f'_barrier_{self.current_sync_id}', threading.Barrier(self.num_gpus))
-            current_barrier = getattr(self, f'_barrier_{self.current_sync_id}')
-        
-        # 1. Compute batch statistics (aggregate across all tiles in this batch)
+        device = tile_batch.device
         batch_size = tile_batch.shape[0]
+        
+        # 1. Compute local batch statistics (aggregate across all tiles in this batch)
         var_list = []
         mean_list = []
         pixel_counts = []
@@ -61,90 +44,57 @@ class SDXLGroupNormSync:
             mean_list.append(mean)
             pixel_counts.append(pixel_count)
         
-        # 2. Aggregate statistics for this GPU's batch
+        # 2. Aggregate statistics for this process's batch
         total_pixels = sum(pixel_counts)
         weights = [count / total_pixels for count in pixel_counts]
         
-        # Weighted average across tiles in this GPU's batch
-        batch_mean = sum(w * m for w, m in zip(weights, mean_list))
-        batch_var = sum(w * v for w, v in zip(weights, var_list))
+        # Weighted average across tiles in this process's batch
+        local_mean = sum(w * m for w, m in zip(weights, mean_list))
+        local_var = sum(w * v for w, v in zip(weights, var_list))
         
-        # 3. Collect batch statistics from this GPU
-        with self.stats_lock:
-            self.batch_stats.append({
-                'mean': batch_mean.cpu(),
-                'var': batch_var.cpu(), 
-                'pixel_count': total_pixels,
-                'gpu_id': gpu_id,
-                'sync_id': self.current_sync_id
-            })
+        # 3. Create tensors for distributed communication
+        # Pack mean, var, and pixel count for collective operations
+        local_stats = torch.stack([
+            local_mean.flatten(),
+            local_var.flatten(),
+            torch.tensor(total_pixels, device=device, dtype=local_mean.dtype).expand_as(local_mean.flatten())
+        ], dim=0)  # [3, num_groups]
         
-        # 4. Wait for ALL GPUs to reach this point
-        print(f"[GPU {gpu_id}] Waiting at barrier for sync {self.current_sync_id}, stats collected: {len(self.batch_stats)}")
-        current_barrier.wait()
-        print(f"[GPU {gpu_id}] Passed barrier for sync {self.current_sync_id}")
+        # 4. Gather statistics from all processes
+        all_stats = [torch.zeros_like(local_stats) for _ in range(self.world_size)]
+        dist.all_gather(all_stats, local_stats)
         
-        # 5. Compute global statistics (only one thread does this)
-        device = tile_batch.device
-        with self.stats_lock:
-            # Filter stats for current sync point only
-            current_sync_stats = [stat for stat in self.batch_stats if stat['sync_id'] == self.current_sync_id]
-            if len(current_sync_stats) == self.num_gpus:
-                # Weighted average across all GPU batches for this sync point
-                total_pixels_global = sum(stat['pixel_count'] for stat in current_sync_stats)
-                global_weights = [stat['pixel_count'] / total_pixels_global for stat in current_sync_stats]
-                
-                # Move all stats to current device before computation
-                global_mean = torch.zeros_like(current_sync_stats[0]['mean']).to(device)
-                global_var = torch.zeros_like(current_sync_stats[0]['var']).to(device)
-                
-                for w, stat in zip(global_weights, current_sync_stats):
-                    global_mean += w * stat['mean'].to(device)
-                    global_var += w * stat['var'].to(device)
-                
-                # Store for other threads with sync_id
-                setattr(self, f'_global_mean_{self.current_sync_id}', global_mean)
-                setattr(self, f'_global_var_{self.current_sync_id}', global_var)
+        # 5. Compute global weighted statistics
+        total_pixels_global = sum(stats[2].sum().item() for stats in all_stats)
         
-        # 6. All threads use the computed global statistics
+        global_mean = torch.zeros_like(local_mean)
+        global_var = torch.zeros_like(local_var)
+        
+        for stats in all_stats:
+            weight = stats[2].sum().item() / total_pixels_global
+            global_mean += weight * stats[0].view_as(local_mean)
+            global_var += weight * stats[1].view_as(local_var)
+        
+        # 6. Apply group norm to entire batch
         weight = norm_layer.weight.to(device) if hasattr(norm_layer, 'weight') and norm_layer.weight is not None else None
         bias = norm_layer.bias.to(device) if hasattr(norm_layer, 'bias') and norm_layer.bias is not None else None
         
-        # Get global statistics for this sync point
-        global_mean = getattr(self, f'_global_mean_{self.current_sync_id}')
-        global_var = getattr(self, f'_global_var_{self.current_sync_id}')
-        
-        # Apply group norm to entire batch
         normalized_batch = []
         for i in range(batch_size):
             tile = tile_batch[i:i+1]  # [1, C, H, W]
-            # Ensure global statistics are on the same device as the tile
-            tile_global_mean = global_mean.to(tile.device)
-            tile_global_var = global_var.to(tile.device)
             normalized_tile = custom_group_norm(
-                tile, 32, tile_global_mean, tile_global_var, weight, bias
+                tile, 32, global_mean, global_var, weight, bias
             )
             normalized_batch.append(normalized_tile)
         
         normalized_tile_batch = torch.cat(normalized_batch, dim=0)  # [batch_size, C, H, W]
-        
-        # 7. Prepare for next sync point
-        with self.stats_lock:
-            # Remove stats for this sync point to avoid accumulation
-            self.batch_stats = [stat for stat in self.batch_stats if stat['sync_id'] != self.current_sync_id]
-            # Only advance sync_id once per sync point
-            if not hasattr(self, f'_advanced_{self.current_sync_id}'):
-                setattr(self, f'_advanced_{self.current_sync_id}', True)
-                self.current_sync_id += 1
-                print(f"[GPU {gpu_id}] Advanced to sync_id {self.current_sync_id}")
-        
         return normalized_tile_batch
 
 
-class MultiGPUVAEHook(VAEHook):
+class DistributedVAEHook(VAEHook):
     """
-    Multi-GPU version of VAEHook optimized for SDXL VAE
-    Handles exactly 34 group norm synchronization points
+    Distributed Multi-GPU VAE Hook using PyTorch multiprocessing
+    Eliminates GIL bottleneck with process-based parallelization
     """
     
     def __init__(self, net, tile_size, is_decoder, fast_decoder, fast_encoder, color_fix, num_gpus=None, to_gpu=True):
@@ -158,178 +108,53 @@ class MultiGPUVAEHook(VAEHook):
             
         self.device_ids = list(range(self.num_gpus))
         
-        # Create synchronizer for GPU threads
-        self.group_norm_sync = SDXLGroupNormSync(self.num_gpus)
-        
-        print(f"[Multi-GPU VAE]: Using {self.num_gpus} GPUs for SDXL VAE: {self.device_ids}")
-        print(f"[Multi-GPU VAE]: Expected sync points: {17 if is_decoder else 17}")
+        print(f"[Distributed VAE]: Using {self.num_gpus} GPUs for SDXL VAE: {self.device_ids}")
     
     def __call__(self, x):
-        B, C, H, W = x.shape
+        H, W = x.shape[2], x.shape[3]
         original_device = next(self.net.parameters()).device
         
         try:
             if max(H, W) <= self.pad * 2 + self.tile_size:
-                print("[Multi-GPU VAE]: Input size is small, using single GPU")
+                print("[Distributed VAE]: Input size is small, using single GPU")
                 return self.net.original_forward(x)
             elif self.num_gpus <= 1:
-                print("[Multi-GPU VAE]: Only 1 GPU available, falling back to single GPU")
+                print("[Distributed VAE]: Only 1 GPU available, falling back to single GPU")
                 return super().vae_tile_forward(x)
             else:
-                return self.multi_gpu_vae_tile_forward(x)
+                return self.distributed_vae_forward(x)
         finally:
             self.net.to(original_device)
     
-    def gpu_worker(self, gpu_id, tile_batches, result_queue, task_queue_template, gpu_network):
-        """Worker function that processes tile batches on a specific GPU"""
-        device = f'cuda:{gpu_id}'
-        
-        try:
-            net_replica = self.net
-            
-            # Get tiles assigned to this GPU
-            gpu_tiles = tile_batches[gpu_id]['tiles']
-            gpu_in_bboxes = tile_batches[gpu_id]['in_bboxes']
-            gpu_out_bboxes = tile_batches[gpu_id]['out_bboxes']
-            gpu_tile_indices = tile_batches[gpu_id]['tile_indices']
-            
-            if len(gpu_tiles) == 0:
-                return  # No tiles for this GPU
-            
-            # Concatenate tiles into batch: [batch_size, C, H, W]
-            # Each tile: [1, C, H, W] -> concat -> [num_tiles, C, H, W]
-            tile_batch = torch.cat([tile.to(device) for tile in gpu_tiles], dim=0)
-            
-            # Use the pre-loaded network for this GPU
-            net_replica = gpu_network
-            
-            # Process the tile batch with multi-GPU sync (no gradients needed)
-            with torch.no_grad():
-                processed_batch = self.execute_task_queue_on_batch_threaded(
-                    tile_batch, task_queue_template, net_replica, gpu_id)
-            
-            # Process results for each tile in the batch
-            for i, (processed_tile, in_bbox, out_bbox, tile_idx) in enumerate(
-                zip(processed_batch, gpu_in_bboxes, gpu_out_bboxes, gpu_tile_indices)):
-                
-                # Crop to valid region
-                cropped_tile = crop_valid_region(
-                    processed_tile.unsqueeze(0), in_bbox, out_bbox, self.is_decoder).squeeze(0)
-                
-                # Return result
-                result_queue.put({
-                    'tile_idx': tile_idx,
-                    'tile': cropped_tile.cpu(),
-                    'out_bbox': out_bbox,
-                    'success': True
-                })
-            
-            del tile_batch, processed_batch
-            torch.cuda.empty_cache()
-                    
-        except Exception as e:
-            import traceback
-            print(f"[GPU {gpu_id}] FULL TRACEBACK:")
-            print(traceback.format_exc())
-            print(f"GPU worker {gpu_id} failed: {e}")
-            result_queue.put({
-                'tile_idx': -1,
-                'error': str(e),
-                'success': False
-            })
-        
-    def execute_task_queue_on_batch_threaded(self, tile_batch, task_queue_template, net, gpu_id):
-        """Execute task queue on a tile batch with multi-GPU synchronization"""
-        device = tile_batch.device
-        task_queue = clone_task_queue(task_queue_template)
-        
-        sync_count = 0
-        total_tasks = len(task_queue)
-        print(f"[GPU {gpu_id}] Starting task queue execution with {total_tasks} tasks")
-        
-        while len(task_queue) > 0:
-            task = task_queue.pop(0)
-            
-            if task[0] == 'pre_norm':
-                # CRITICAL: Multi-GPU Group Norm Synchronization on batch
-                sync_count += 1
-                print(f"[GPU {gpu_id}] Executing sync point {sync_count}")
-                tile_batch = self.group_norm_sync.collect_and_sync_group_norm_batch(
-                    tile_batch, task[1], gpu_id)
-                print(f"[GPU {gpu_id}] Completed sync point {sync_count}")
-                
-            elif task[0] == 'store_res' or task[0] == 'store_res_cpu':
-                # Store residual connection (apply to batch)
-                task_id = 0
-                res = task[1](tile_batch)
-                if not self.fast_mode or task[0] == 'store_res_cpu':
-                    res = res.cpu()
-                # Find corresponding add_res task
-                while task_id < len(task_queue) and task_queue[task_id][0] != 'add_res':
-                    task_id += 1
-                if task_id < len(task_queue):
-                    task_queue[task_id][1] = res
-                    
-            elif task[0] == 'add_res':
-                # Add residual connection (apply to batch)
-                if task[1] is not None:
-                    tile_batch += task[1].to(device)
-                    task[1] = None
-                    
-            elif task[0] == 'apply_norm':
-                # Pre-computed norm from fast mode (apply to batch)
-                tile_batch = task[1](tile_batch)
-                
-            else:
-                # Regular operations: conv, silu, etc. (apply to batch)
-                tile_batch = task[1](tile_batch)
-        
-        print(f"[GPU {gpu_id}] Completed task queue execution with {sync_count} sync points")
-        return tile_batch
-    
-    def multi_gpu_vae_tile_forward(self, z):
-        """Multi-GPU tiled VAE forward pass with optimized batching"""
+    def distributed_vae_forward(self, z):
+        """Main distributed VAE forward pass using multiprocessing"""
         dtype = z.dtype
         N, height, width = z.shape[0], z.shape[2], z.shape[3]
         
-        print(f'[Multi-GPU VAE]: input_size: {z.shape}, tile_size: {self.tile_size}, padding: {self.pad}')
+        print(f'[Distributed VAE]: input_size: {z.shape}, tile_size: {self.tile_size}')
         
         # Split into tiles
         in_bboxes, out_bboxes = self.split_tiles(height, width)
         num_tiles = len(in_bboxes)
         
-        # OPTIMIZATION: Adjust tile_size if too many tiles
-        if num_tiles > self.num_gpus * 2:  # Allow max 2 batches
-            # Increase tile size to reduce tile count
-            scale_factor = math.ceil(math.sqrt(num_tiles / self.num_gpus))
-            new_tile_size = min(self.tile_size * scale_factor, max(height, width))
-            print(f"[Multi-GPU VAE]: Too many tiles ({num_tiles}), increasing tile_size from {self.tile_size} to {new_tile_size}")
-            
-            # Temporarily increase tile size
-            original_tile_size = self.tile_size
-            self.tile_size = new_tile_size
-            in_bboxes, out_bboxes = self.split_tiles(height, width)
-            num_tiles = len(in_bboxes)
-            self.tile_size = original_tile_size  # Restore original
+        print(f"[Distributed VAE]: Processing {num_tiles} tiles across {self.num_gpus} processes")
         
-        print(f"[Multi-GPU VAE]: Processing {num_tiles} tiles across {self.num_gpus} GPUs")
-        
-        # Prepare tiles
+        # Prepare tiles and save to shared memory
         tiles = []
         for input_bbox in in_bboxes:
-            tile = z[:, :, input_bbox[2]:input_bbox[3], input_bbox[0]:input_bbox[1]].cpu()
+            tile = z[:, :, input_bbox[2]:input_bbox[3], input_bbox[0]:input_bbox[1]]
+            tile = tile.share_memory_()  # Share memory for multiprocessing
             tiles.append(tile)
         
-        # Build task queues
+        # Build task queue
         single_task_queue = build_task_queue(self.net, self.is_decoder)
         
         # Fast mode estimation (if enabled)
         if self.fast_mode:
             scale_factor = self.tile_size / max(height, width)
-            z_device = z.to(self.device_ids[0])  # Use first GPU for estimation
+            z_device = z.to(f'cuda:{self.device_ids[0]}')
             downsampled_z = torch.nn.functional.interpolate(z_device, scale_factor=scale_factor, mode='nearest-exact')
             
-            # Recover statistics
             std_old, mean_old = torch.std_mean(z_device, dim=[0, 2, 3], keepdim=True)
             std_new, mean_new = torch.std_mean(downsampled_z, dim=[0, 2, 3], keepdim=True)
             downsampled_z = (downsampled_z - mean_new) / std_new * std_old + mean_old
@@ -343,117 +168,179 @@ class MultiGPUVAEHook(VAEHook):
         
         del z  # Free input memory
         
-        # Initialize result tensor
+        # Allocate tiles to processes
+        tile_batches = self.allocate_tiles_to_processes(tiles, in_bboxes, out_bboxes)
+        
+        # Initialize result tensor in shared memory
         result = torch.zeros(
             (N, tiles[0].shape[1], 
              height * 8 if self.is_decoder else height // 8, 
              width * 8 if self.is_decoder else width // 8), 
-            device=f'cuda:{self.device_ids[0]}', 
-            requires_grad=False,
             dtype=dtype
+        ).share_memory_()
+        
+        # Setup distributed training
+        os.environ['MASTER_ADDR'] = 'localhost'
+        os.environ['MASTER_PORT'] = '12355'
+        
+        # Spawn processes
+        mp.spawn(
+            self.distributed_worker,
+            args=(self.num_gpus, tile_batches, result, out_bboxes, single_task_queue),
+            nprocs=self.num_gpus,
+            join=True
         )
         
-        # BATCH ALLOCATION: Distribute tiles across GPUs
-        tile_batches = self.allocate_tiles_to_gpus(tiles, in_bboxes, out_bboxes, num_tiles)
-        
-        # PRE-LOAD MODELS: Create clean network replicas without threading locks
-        print("[Multi-GPU VAE]: Pre-loading models on all GPUs...")
-        gpu_networks = {}
-        
-        # Save original forward method and temporarily restore it for copying
-        if hasattr(self.net, 'original_forward'):
-            temp_forward = self.net.forward
-            self.net.forward = self.net.original_forward
-        
-        for gpu_id in self.device_ids:
-            device = f'cuda:{gpu_id}'
-            # Now we can safely deepcopy the network without threading locks
-            import copy
-            gpu_networks[gpu_id] = copy.deepcopy(self.net).to(device).eval()
-            print(f"[Multi-GPU VAE]: Model loaded on GPU {gpu_id}")
-        
-        # Restore our hooked forward method
-        if hasattr(self.net, 'original_forward'):
-            self.net.forward = temp_forward
-        
-        # Create result queue
-        result_queue = queue.Queue()
-                
-        # Start worker threads - one per GPU
-        workers = []
-        for gpu_id in self.device_ids:
-            worker = threading.Thread(
-                target=self.gpu_worker,
-                args=(gpu_id, tile_batches, result_queue, single_task_queue, gpu_networks[gpu_id])
-            )
-            worker.start()
-            workers.append(worker)
-        
-        # Collect results
-        completed_tiles = 0
-        pbar = tqdm(total=num_tiles, desc="Processing tiles")
-        
-        while completed_tiles < num_tiles:
-            try:
-                tile_result = result_queue.get(timeout=30.0)
-                
-                if tile_result['success']:
-                    out_bbox = tile_result['out_bbox']
-                    processed_tile = tile_result['tile'].to(result.device)
-                    result[:, :, out_bbox[2]:out_bbox[3], out_bbox[0]:out_bbox[1]] = processed_tile
-                    del processed_tile
-                    completed_tiles += 1
-                    pbar.update(1)
-                else:
-                    print(f"Error processing tile: {tile_result.get('error', 'Unknown error')}")
-                    
-            except queue.Empty:
-                print(f"Timeout waiting for tile results. Completed: {completed_tiles}/{num_tiles}")
-                print("Checking worker status...")
-                for i, worker in enumerate(workers):
-                    print(f"Worker {i} alive: {worker.is_alive()}")
-                break
-        
-        pbar.close()
-        
-        # Wait for workers to finish
-        for worker in workers:
-            worker.join()
-        
         return result.to(dtype)
+
+    def distributed_worker(self, rank, world_size, tile_batches, result, out_bboxes, task_queue_template):
+        """Distributed worker process for GPU processing"""
+        # Initialize distributed environment
+        dist.init_process_group(
+            backend='nccl',
+            init_method='env://',
+            rank=rank,
+            world_size=world_size
+        )
+        
+        device = f'cuda:{rank}'
+        torch.cuda.set_device(rank)
+        
+        try:
+            # Load model on this GPU
+            import copy
+            net_replica = copy.deepcopy(self.net).to(device).eval()
+            
+            # Get tiles for this process
+            process_tiles = tile_batches[rank]
+            if len(process_tiles) == 0:
+                return
+            
+            # Create distributed sync
+            group_norm_sync = DistributedGroupNormSync(rank, world_size)
+            
+            # Process tiles
+            for tile_idx, tile in enumerate(process_tiles):
+                tile_tensor = tile.to(device)
+                
+                # Process with distributed sync
+                processed_tile = self.execute_distributed_task_queue(
+                    tile_tensor.unsqueeze(0), task_queue_template, net_replica, group_norm_sync
+                )
+                
+                # Get original tile index
+                original_idx = rank + tile_idx * world_size
+                if original_idx < len(out_bboxes):
+                    out_bbox = out_bboxes[original_idx]
+                    processed_tile = crop_valid_region(
+                        processed_tile, None, out_bbox, self.is_decoder
+                    ).squeeze(0)
+                    
+                    # Write to result
+                    result[:, :, out_bbox[2]:out_bbox[3], out_bbox[0]:out_bbox[1]] = processed_tile.cpu()
+                    
+            torch.cuda.empty_cache()
+            
+        except Exception as e:
+            print(f"[Process {rank}] Error: {e}")
+            raise
+        finally:
+            dist.destroy_process_group()
+
+    def execute_distributed_task_queue(self, tile_batch, task_queue_template, net, group_norm_sync):
+        """Execute task queue with distributed group norm synchronization"""
+        device = tile_batch.device
+        # Clone task queue and replace network references with local replica
+        task_queue = self.build_local_task_queue(task_queue_template, net)
+        
+        while len(task_queue) > 0:
+            task = task_queue.pop(0)
+            
+            if task[0] == 'pre_norm':
+                # Distributed Group Norm Synchronization
+                tile_batch = group_norm_sync.collect_and_sync_group_norm_batch(
+                    tile_batch, task[1]
+                )
+                
+            elif task[0] == 'store_res' or task[0] == 'store_res_cpu':
+                task_id = 0
+                res = task[1](tile_batch)
+                if not self.fast_mode or task[0] == 'store_res_cpu':
+                    res = res.cpu()
+                while task_id < len(task_queue) and task_queue[task_id][0] != 'add_res':
+                    task_id += 1
+                if task_id < len(task_queue):
+                    task_queue[task_id][1] = res
+                    
+            elif task[0] == 'add_res':
+                if task[1] is not None:
+                    tile_batch += task[1].to(device)
+                    task[1] = None
+                    
+            elif task[0] == 'apply_norm':
+                tile_batch = task[1](tile_batch)
+                
+            else:
+                tile_batch = task[1](tile_batch)
+        
+        return tile_batch
     
-    def allocate_tiles_to_gpus(self, tiles, in_bboxes, out_bboxes, num_tiles):
-        """Allocate tiles to GPUs in round-robin fashion for load balancing"""
-        tile_batches = {}
+    def build_local_task_queue(self, task_queue_template, local_net):
+        """Build task queue with local network references instead of original ones"""
+        # Create mapping from original network modules to local network modules
+        original_net = self.net
+        module_mapping = self.create_module_mapping(original_net, local_net)
         
-        # Initialize empty batches for each GPU
-        for gpu_id in self.device_ids:
-            tile_batches[gpu_id] = {
-                'tiles': [],
-                'in_bboxes': [],
-                'out_bboxes': [],
-                'tile_indices': []
-            }
+        # Clone task queue and replace module references
+        local_task_queue = []
+        for task in task_queue_template:
+            if len(task) >= 2 and hasattr(task[1], '__call__'):
+                # This is a network operation task
+                original_module = task[1]
+                if original_module in module_mapping:
+                    # Replace with local network module
+                    local_task = [task[0], module_mapping[original_module]] + task[2:]
+                else:
+                    # Keep as is (might be a function or other callable)
+                    local_task = list(task)
+            else:
+                # Non-network task, clone as-is
+                local_task = list(task)
+            local_task_queue.append(local_task)
         
-        # Distribute tiles round-robin across GPUs
-        for i, (tile, in_bbox, out_bbox) in enumerate(zip(tiles, in_bboxes, out_bboxes)):
-            gpu_id = i % self.num_gpus
-            tile_batches[gpu_id]['tiles'].append(tile)
-            tile_batches[gpu_id]['in_bboxes'].append(in_bbox)
-            tile_batches[gpu_id]['out_bboxes'].append(out_bbox)
-            tile_batches[gpu_id]['tile_indices'].append(i)
+        return local_task_queue
+    
+    def create_module_mapping(self, original_net, local_net):
+        """Create mapping from original network modules to local network modules"""
+        mapping = {}
         
-        # Print allocation summary
-        for gpu_id in self.device_ids:
-            batch_size = len(tile_batches[gpu_id]['tiles'])
-            print(f"[Multi-GPU VAE]: GPU {gpu_id} allocated {batch_size} tiles")
+        # Map the network itself
+        mapping[original_net] = local_net
+        
+        # Recursively map all submodules
+        for (orig_name, orig_module), (local_name, local_module) in zip(
+            original_net.named_modules(), local_net.named_modules()
+        ):
+            if orig_name == local_name:  # Should match if networks are identical
+                mapping[orig_module] = local_module
+        
+        return mapping
+    
+    def allocate_tiles_to_processes(self, tiles, in_bboxes, out_bboxes):
+        """Allocate tiles to processes in round-robin fashion"""
+        tile_batches = [[] for _ in range(self.num_gpus)]
+        
+        for i, tile in enumerate(tiles):
+            process_id = i % self.num_gpus
+            tile_batches[process_id].append(tile)
         
         return tile_batches
 
 
-def create_multi_gpu_vae_hook(net, tile_size, is_decoder, fast_decoder=False, fast_encoder=False, color_fix=False, num_gpus=None):
-    """Factory function to create MultiGPUVAEHook"""
-    return MultiGPUVAEHook(
+
+def create_distributed_vae_hook(net, tile_size, is_decoder, fast_decoder=False, fast_encoder=False, color_fix=False, num_gpus=None):
+    """Factory function to create DistributedVAEHook"""
+    return DistributedVAEHook(
         net=net,
         tile_size=tile_size, 
         is_decoder=is_decoder,
@@ -463,3 +350,6 @@ def create_multi_gpu_vae_hook(net, tile_size, is_decoder, fast_decoder=False, fa
         num_gpus=num_gpus,
         to_gpu=True
     )
+
+# Backward compatibility
+create_multi_gpu_vae_hook = create_distributed_vae_hook
