@@ -14,6 +14,96 @@ from einops import rearrange
 
 def distributed_worker_function(rank, net, world_size, input_data, is_decoder, fast_mode, z_original):
     """Global function for distributed worker - avoids self serialization issues"""
+    # Fix module path for spawned processes
+    import sys
+    import os
+    
+    # Add ComfyUI paths to sys.path
+    comfy_path = '/workspace/MyDeptEDS/yangli/projects/ComfyUI'
+    custom_nodes_path = '/workspace/MyDeptEDS/yangli/projects/ComfyUI/custom_nodes'
+    supir_path = '/workspace/MyDeptEDS/yangli/projects/ComfyUI/custom_nodes/ComfyUI-SUPIR-Parallel'
+    
+    if comfy_path not in sys.path:
+        sys.path.insert(0, comfy_path)
+    if custom_nodes_path not in sys.path:
+        sys.path.insert(0, custom_nodes_path)
+    if supir_path not in sys.path:
+        sys.path.insert(0, supir_path)
+    
+    # Now we can import the required modules
+    try:
+        from SUPIR.utils.tilevae import build_task_queue, crop_valid_region, get_var_mean, custom_group_norm
+        import torch
+        import torch.distributed as dist
+        import copy
+        
+        # Import the DistributedGroupNormSync class from current module
+        # We need to redefine it here since it's not easily importable in spawned process
+        class DistributedGroupNormSync:
+            def __init__(self, rank: int, world_size: int):
+                self.rank = rank
+                self.world_size = world_size
+                
+            def collect_and_sync_group_norm_batch(self, tile_batch: torch.Tensor, norm_layer):
+                device = tile_batch.device
+                batch_size = tile_batch.shape[0]
+                
+                var_list = []
+                mean_list = []
+                pixel_counts = []
+                
+                for i in range(batch_size):
+                    tile = tile_batch[i:i+1]
+                    var, mean = get_var_mean(tile, 32)
+                    pixel_count = tile.shape[2] * tile.shape[3]
+                    
+                    var_list.append(var)
+                    mean_list.append(mean)
+                    pixel_counts.append(pixel_count)
+                
+                total_pixels = sum(pixel_counts)
+                weights = [count / total_pixels for count in pixel_counts]
+                
+                local_mean = sum(w * m for w, m in zip(weights, mean_list))
+                local_var = sum(w * v for w, v in zip(weights, var_list))
+                
+                local_stats = torch.stack([
+                    local_mean.flatten(),
+                    local_var.flatten(),
+                    torch.tensor(total_pixels, device=device, dtype=local_mean.dtype).expand_as(local_mean.flatten())
+                ], dim=0)
+                
+                all_stats = [torch.zeros_like(local_stats) for _ in range(self.world_size)]
+                dist.all_gather(all_stats, local_stats)
+                
+                total_pixels_global = sum(stats[2].sum().item() for stats in all_stats)
+                
+                global_mean = torch.zeros_like(local_mean)
+                global_var = torch.zeros_like(local_var)
+                
+                for stats in all_stats:
+                    weight = stats[2].sum().item() / total_pixels_global
+                    global_mean += weight * stats[0].view_as(local_mean)
+                    global_var += weight * stats[1].view_as(local_var)
+                
+                weight = norm_layer.weight.to(device) if hasattr(norm_layer, 'weight') and norm_layer.weight is not None else None
+                bias = norm_layer.bias.to(device) if hasattr(norm_layer, 'bias') and norm_layer.bias is not None else None
+                
+                normalized_batch = []
+                for i in range(batch_size):
+                    tile = tile_batch[i:i+1]
+                    normalized_tile = custom_group_norm(
+                        tile, 32, global_mean, global_var, weight, bias
+                    )
+                    normalized_batch.append(normalized_tile)
+                
+                normalized_tile_batch = torch.cat(normalized_batch, dim=0)
+                return normalized_tile_batch
+        
+    except ImportError as e:
+        print(f"--------Worker {rank}: Import error: {e}-----------")
+        return
+    
     # Now rank is directly 0, 1, 2, 3... (no adjustment needed)
     actual_rank = rank
     
