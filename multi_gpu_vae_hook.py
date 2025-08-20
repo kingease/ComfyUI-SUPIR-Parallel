@@ -457,6 +457,11 @@ class DistributedVAEHook(VAEHook):
                     print("========1.1.9: Testing function serialization")
                     print(f"Function module: {distributed_worker_function.__module__}")
                     print(f"Function name: {distributed_worker_function.__name__}")
+                    
+                    # Fix the module name to make it picklable
+                    distributed_worker_function.__module__ = '__main__'
+                    print(f"Fixed function module: {distributed_worker_function.__module__}")
+                    
                     pickle.dumps(distributed_worker_function)
                     print("========1.1.10: function serializable")
                 except Exception as e:
