@@ -12,7 +12,7 @@ import comfy.utils
 from einops import rearrange
 
 
-def distributed_worker_function(rank, net, world_size, input_data, is_decoder, fast_mode, z_original):
+def distributed_worker_function(rank, network_info, world_size, input_data, is_decoder, fast_mode, z_original):
     """Global function for distributed worker - avoids self serialization issues"""
     # Fix module path for spawned processes
     import sys
@@ -138,12 +138,15 @@ def distributed_worker_function(rank, net, world_size, input_data, is_decoder, f
         # Broadcast input tensor from rank 0 to all ranks
         dist.broadcast(z_local, src=0)
         
-        # Load model replica on this GPU
-        import copy
-        net_replica = copy.deepcopy(net).to(device).eval()
+        # Recreate network on this GPU instead of using passed network object
+        print(f"--------Worker {rank}: Recreating network from state dict-----------")
+        # For now, we'll use a simplified approach - just create a dummy network
+        # In practice, you'd recreate the actual network based on network_info
+        net_replica = None  # We'll handle this differently
         
-        # Build task queue locally in this process
-        task_queue_template = build_task_queue(net_replica, is_decoder)
+        # Skip task queue for now since we don't have network
+        # task_queue_template = build_task_queue(net_replica, is_decoder)
+        print(f"--------Worker {rank}: Skipping task queue build for test-----------")
         
         # Distribute tiles to this process (using actual_rank for distribution)
         tiles_for_rank = []
@@ -168,18 +171,19 @@ def distributed_worker_function(rank, net, world_size, input_data, is_decoder, f
                        z_shape[3] * 8 if is_decoder else z_shape[3] // 8)
         local_result = torch.zeros(result_shape, dtype=z_dtype, device=device)
         
-        # Process assigned tiles and write to local result
-        for tile, (in_bbox, out_bbox) in zip(tiles_for_rank, bboxes_for_rank):
-            processed_tile = execute_distributed_task_queue_static(
-                tile.unsqueeze(0), task_queue_template, net_replica, group_norm_sync, fast_mode
-            )
-            
-            processed_tile = crop_valid_region(
-                processed_tile, None, out_bbox, is_decoder
-            ).squeeze(0)
-            
-            # Write to local result tensor
-            local_result[:, :, out_bbox[2]:out_bbox[3], out_bbox[0]:out_bbox[1]] = processed_tile
+        # Skip actual processing for now - just test if workers start
+        print(f"--------Worker {rank}: Skipping tile processing for test-----------")
+        # for tile, (in_bbox, out_bbox) in zip(tiles_for_rank, bboxes_for_rank):
+        #     processed_tile = execute_distributed_task_queue_static(
+        #         tile.unsqueeze(0), task_queue_template, net_replica, group_norm_sync, fast_mode
+        #     )
+        #     
+        #     processed_tile = crop_valid_region(
+        #         processed_tile, None, out_bbox, is_decoder
+        #     ).squeeze(0)
+        #     
+        #     # Write to local result tensor
+        #     local_result[:, :, out_bbox[2]:out_bbox[3], out_bbox[0]:out_bbox[1]] = processed_tile
         
         # Use NCCL reduce to send result to rank 0 (main process)
         dist.reduce(local_result, dst=0, op=dist.ReduceOp.SUM)
@@ -452,11 +456,13 @@ class DistributedVAEHook(VAEHook):
                     print(f"========1.1.ERROR: Serialization failed: {e}")
                     import traceback
                     traceback.print_exc()
+                    return
                 
                 # Spawn ALL workers (including what would be rank 0)
+                # Remove self.net to test if that fixes the module import issue
                 results = mp.spawn(
                     distributed_worker_function,  # Use global function instead of method
-                    args=(self.net, self.num_gpus, input_data, self.is_decoder, self.fast_mode, z),
+                    args=(None, self.num_gpus, input_data, self.is_decoder, self.fast_mode, z),
                     nprocs=self.num_gpus,  # ALL GPUs as workers
                     join=True  # Wait for completion and get results
                 )
