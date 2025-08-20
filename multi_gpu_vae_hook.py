@@ -458,12 +458,32 @@ class DistributedVAEHook(VAEHook):
                     print(f"Function module: {distributed_worker_function.__module__}")
                     print(f"Function name: {distributed_worker_function.__name__}")
                     
-                    # Fix the module name to make it picklable
-                    distributed_worker_function.__module__ = '__main__'
-                    print(f"Fixed function module: {distributed_worker_function.__module__}")
+                    # Fix the module name to be properly importable
+                    # Use the current module name without the full path
+                    import __main__
+                    current_module_name = __name__
+                    print(f"Current module __name__: {current_module_name}")
                     
+                    # Try to use the proper module name that child processes can import
+                    if current_module_name and not current_module_name.startswith('/'):
+                        # If we have a proper module name, use it
+                        distributed_worker_function.__module__ = current_module_name
+                        print(f"Using current module name: {current_module_name}")
+                    else:
+                        # Fallback to a simple name
+                        distributed_worker_function.__module__ = 'multi_gpu_vae_hook'
+                        print(f"Using fallback module name: multi_gpu_vae_hook")
+                    
+                    # Test if this can be pickled
                     pickle.dumps(distributed_worker_function)
                     print("========1.1.10: function serializable")
+                    
+                    # Add current directory to environment for child processes
+                    import sys
+                    current_dir = os.path.dirname(os.path.abspath(__file__))
+                    if current_dir not in sys.path:
+                        sys.path.insert(0, current_dir)
+                    print(f"Added to sys.path: {current_dir}")
                 except Exception as e:
                     print(f"========1.1.ERROR: Serialization failed: {e}")
                     import traceback
