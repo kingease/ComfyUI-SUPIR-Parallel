@@ -482,10 +482,28 @@ class DistributedVAEHook(VAEHook):
                                 
                                 # Add parent directory (custom_nodes) to sys.path
                                 import sys
-                                parent_dir = parts[0] + 'custom_nodes'  # Gets /workspace/.../custom_nodes
+                                # parts[0] already ends with "custom_nodes/", so just use it
+                                parent_dir = parts[0].rstrip('/')  # Remove trailing slash if any
+                                if not parent_dir.endswith('custom_nodes'):
+                                    parent_dir = parent_dir + '/custom_nodes'
                                 if parent_dir not in sys.path:
                                     sys.path.insert(0, parent_dir)
                                 print(f"Added parent to sys.path: {parent_dir}")
+                                
+                                # Fix the object identity issue by importing the function properly
+                                try:
+                                    # Import the module and get the function from it
+                                    import importlib
+                                    module = importlib.import_module(proper_module_name)
+                                    imported_function = getattr(module, 'distributed_worker_function')
+                                    print(f"Successfully imported function from module")
+                                    
+                                    # Use the imported function instead of the local one
+                                    test_function = imported_function
+                                except Exception as import_error:
+                                    print(f"Import failed: {import_error}")
+                                    # Keep using the local function but fix its __module__
+                                    test_function = distributed_worker_function
                             else:
                                 print("Could not parse module path properly")
                                 # return super().vae_tile_forward(z)
@@ -495,9 +513,10 @@ class DistributedVAEHook(VAEHook):
                     else:
                         print(f"Using existing module name: {current_module_name}")
                         distributed_worker_function.__module__ = current_module_name
+                        test_function = distributed_worker_function
                     
                     # Test if this can be pickled
-                    pickle.dumps(distributed_worker_function)
+                    pickle.dumps(test_function)
                     print("========1.1.10: function serializable")
                 except Exception as e:
                     print(f"========1.1.ERROR: Serialization failed: {e}")
@@ -506,9 +525,9 @@ class DistributedVAEHook(VAEHook):
                     return
                 
                 # Spawn ALL workers (including what would be rank 0)
-                # Remove self.net to test if that fixes the module import issue
+                # Use test_function (the properly imported and picklable function)
                 results = mp.spawn(
-                    distributed_worker_function,  # Use global function instead of method
+                    test_function,  # Use the imported function that can be pickled
                     args=(None, self.num_gpus, input_data, self.is_decoder, self.fast_mode, z),
                     nprocs=self.num_gpus,  # ALL GPUs as workers
                     join=True  # Wait for completion and get results
