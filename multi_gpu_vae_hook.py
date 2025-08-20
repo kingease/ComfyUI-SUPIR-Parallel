@@ -12,10 +12,10 @@ import comfy.utils
 from einops import rearrange
 
 
-def distributed_worker_function(rank, net, world_size, input_data, is_decoder, fast_mode):
+def distributed_worker_function(rank, net, world_size, input_data, is_decoder, fast_mode, z_original):
     """Global function for distributed worker - avoids self serialization issues"""
-    # Adjust rank since main process is rank 0, spawned processes are rank 1,2,3...
-    actual_rank = rank + 1
+    # Now rank is directly 0, 1, 2, 3... (no adjustment needed)
+    actual_rank = rank
     
     print(f'--------Worker {rank} (actual_rank {actual_rank}) starting-----------')
     
@@ -37,8 +37,13 @@ def distributed_worker_function(rank, net, world_size, input_data, is_decoder, f
         in_bboxes = input_data['in_bboxes']
         out_bboxes = input_data['out_bboxes']
         
-        # Create local tensor to receive broadcast from rank 0
-        z_local = torch.zeros(z_shape, dtype=z_dtype, device=device)
+        # Rank 0 creates the tensor, others receive it
+        if actual_rank == 0:
+            # Rank 0: Create tensor from original input
+            z_local = z_original.to(device)
+        else:
+            # Other ranks: Create empty tensor to receive broadcast
+            z_local = torch.zeros(z_shape, dtype=z_dtype, device=device)
         
         # Broadcast input tensor from rank 0 to all ranks
         dist.broadcast(z_local, src=0)
@@ -91,6 +96,10 @@ def distributed_worker_function(rank, net, world_size, input_data, is_decoder, f
                 
         torch.cuda.empty_cache()
         print(f'--------Worker {rank}: Completed successfully-----------')
+        
+        # Rank 0 returns the final result
+        if actual_rank == 0:
+            return local_result
         
     except Exception as e:
         print(f"--------Worker {rank} ERROR: {e}-----------")
@@ -319,37 +328,44 @@ class DistributedVAEHook(VAEHook):
             # Single GPU case - no distributed processing needed
             return super().vae_tile_forward(z)
         
-        # Spawn worker processes for ranks 1, 2, 3... (main process = rank 0)
-        # NO CUDA tensors in args - only CPU data
+        # Alternative approach: Use all processes as workers, no separate main process logic
         print("========1")
         if self.num_gpus > 1:
             try:
+                # Setup distributed environment for ALL processes including main
+                os.environ['MASTER_ADDR'] = 'localhost'
+                os.environ['MASTER_PORT'] = '12355'
+                
                 # Try different start method to avoid conflicts
                 mp.set_start_method('spawn', force=True)
                 print("========1.1: Starting mp.spawn")
                 
-                ctx = mp.spawn(
+                # Spawn ALL workers (including what would be rank 0)
+                results = mp.spawn(
                     distributed_worker_function,  # Use global function instead of method
-                    args=(self.net, self.num_gpus, input_data, self.is_decoder, self.fast_mode),
-                    nprocs=self.num_gpus - 1,  # Main process handles rank 0
-                    join=False  # Don't block main process
+                    args=(self.net, self.num_gpus, input_data, self.is_decoder, self.fast_mode, z),
+                    nprocs=self.num_gpus,  # ALL GPUs as workers
+                    join=True  # Wait for completion and get results
                 )
                 print("========1.2: mp.spawn completed")
+                
+                # Extract result from rank 0 (first process)
+                if results and len(results) > 0:
+                    result = results[0]  # Result from rank 0
+                    if result is not None:
+                        print("========1.3: Got result from rank 0")
+                        return result.to(z.device)
+                
+                print("========1.3: No result from workers, using fallback")
+                
             except Exception as e:
                 print(f"========1.ERROR: mp.spawn failed: {e}")
                 import traceback
                 traceback.print_exc()
                 # Fallback to single GPU
                 return super().vae_tile_forward(z)
-        print("========2")
-        # Main process executes rank 0 logic  
-        result = self.execute_rank_0_processing(z, input_data, result_shape)
-        print("========3")
-        # Wait for worker processes to complete
-        if self.num_gpus > 1:
-            ctx.join()
-        print("========4")
-        return result.to(z.device)
+        else:
+            return super().vae_tile_forward(z)
 
     def distributed_worker_nccl(self, rank, world_size, input_data):
         """Distributed worker for ranks 1, 2, 3... (rank 0 = main process)"""
