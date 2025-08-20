@@ -12,6 +12,143 @@ import comfy.utils
 from einops import rearrange
 
 
+def distributed_worker_function(rank, net, world_size, input_data, is_decoder, fast_mode):
+    """Global function for distributed worker - avoids self serialization issues"""
+    # Adjust rank since main process is rank 0, spawned processes are rank 1,2,3...
+    actual_rank = rank + 1
+    
+    print(f'--------Worker {rank} (actual_rank {actual_rank}) starting-----------')
+    
+    try:
+        # Initialize distributed environment
+        dist.init_process_group(
+            backend='nccl',
+            init_method='env://',
+            rank=actual_rank,
+            world_size=world_size
+        )
+        
+        device = f'cuda:{actual_rank}'
+        torch.cuda.set_device(actual_rank)
+        
+        # Extract serializable data (no CUDA tensors here)
+        z_shape = input_data['z_shape']
+        z_dtype = input_data['z_dtype']
+        in_bboxes = input_data['in_bboxes']
+        out_bboxes = input_data['out_bboxes']
+        
+        # Create local tensor to receive broadcast from rank 0
+        z_local = torch.zeros(z_shape, dtype=z_dtype, device=device)
+        
+        # Broadcast input tensor from rank 0 to all ranks
+        dist.broadcast(z_local, src=0)
+        
+        # Load model replica on this GPU
+        import copy
+        net_replica = copy.deepcopy(net).to(device).eval()
+        
+        # Build task queue locally in this process
+        task_queue_template = build_task_queue(net_replica, is_decoder)
+        
+        # Distribute tiles to this process (using actual_rank for distribution)
+        tiles_for_rank = []
+        bboxes_for_rank = []
+        
+        for i, (in_bbox, out_bbox) in enumerate(zip(in_bboxes, out_bboxes)):
+            if i % world_size == actual_rank:  # Round-robin distribution
+                tile = z_local[:, :, in_bbox[2]:in_bbox[3], in_bbox[0]:in_bbox[1]]
+                tiles_for_rank.append(tile)
+                bboxes_for_rank.append((in_bbox, out_bbox))
+        
+        if len(tiles_for_rank) == 0:
+            print(f'--------Worker {rank}: No tiles assigned-----------')
+            return
+        
+        # Create distributed sync for group norm
+        group_norm_sync = DistributedGroupNormSync(actual_rank, world_size)
+        
+        # Initialize result tensor on this GPU
+        result_shape = (z_shape[0], z_shape[1], 
+                       z_shape[2] * 8 if is_decoder else z_shape[2] // 8, 
+                       z_shape[3] * 8 if is_decoder else z_shape[3] // 8)
+        local_result = torch.zeros(result_shape, dtype=z_dtype, device=device)
+        
+        # Process assigned tiles and write to local result
+        for tile, (in_bbox, out_bbox) in zip(tiles_for_rank, bboxes_for_rank):
+            processed_tile = execute_distributed_task_queue_static(
+                tile.unsqueeze(0), task_queue_template, net_replica, group_norm_sync, fast_mode
+            )
+            
+            processed_tile = crop_valid_region(
+                processed_tile, None, out_bbox, is_decoder
+            ).squeeze(0)
+            
+            # Write to local result tensor
+            local_result[:, :, out_bbox[2]:out_bbox[3], out_bbox[0]:out_bbox[1]] = processed_tile
+        
+        # Use NCCL reduce to send result to rank 0 (main process)
+        dist.reduce(local_result, dst=0, op=dist.ReduceOp.SUM)
+                
+        torch.cuda.empty_cache()
+        print(f'--------Worker {rank}: Completed successfully-----------')
+        
+    except Exception as e:
+        print(f"--------Worker {rank} ERROR: {e}-----------")
+        import traceback
+        traceback.print_exc()
+        raise
+    finally:
+        try:
+            dist.destroy_process_group()
+        except:
+            pass
+
+
+def execute_distributed_task_queue_static(tile_batch, task_queue_template, net, group_norm_sync, fast_mode):
+    """Static version of execute_distributed_task_queue for global function"""
+    device = tile_batch.device
+    # Clone task queue and replace network references with local replica
+    task_queue = build_local_task_queue_static(task_queue_template, net)
+    
+    while len(task_queue) > 0:
+        task = task_queue.pop(0)
+        
+        if task[0] == 'pre_norm':
+            # Distributed Group Norm Synchronization
+            tile_batch = group_norm_sync.collect_and_sync_group_norm_batch(
+                tile_batch, task[1]
+            )
+            
+        elif task[0] == 'store_res' or task[0] == 'store_res_cpu':
+            task_id = 0
+            res = task[1](tile_batch)
+            if not fast_mode or task[0] == 'store_res_cpu':
+                res = res.cpu()
+            while task_id < len(task_queue) and task_queue[task_id][0] != 'add_res':
+                task_id += 1
+            if task_id < len(task_queue):
+                task_queue[task_id][1] = res
+                
+        elif task[0] == 'add_res':
+            if task[1] is not None:
+                tile_batch += task[1].to(device)
+                task[1] = None
+                
+        elif task[0] == 'apply_norm':
+            tile_batch = task[1](tile_batch)
+            
+        else:
+            tile_batch = task[1](tile_batch)
+    
+    return tile_batch
+
+
+def build_local_task_queue_static(task_queue_template, local_net):
+    """Static version of build_local_task_queue for global function"""
+    # For now, just return the template - we'll need to fix module mapping
+    return task_queue_template
+
+
 class DistributedGroupNormSync:
     """
     Distributed synchronization for SDXL VAE Group Normalization
@@ -186,12 +323,24 @@ class DistributedVAEHook(VAEHook):
         # NO CUDA tensors in args - only CPU data
         print("========1")
         if self.num_gpus > 1:
-            ctx = mp.spawn(
-                self.distributed_worker_nccl,
-                args=(self.num_gpus, input_data),
-                nprocs=self.num_gpus - 1,  # Main process handles rank 0
-                join=False  # Don't block main process
-            )
+            try:
+                # Try different start method to avoid conflicts
+                mp.set_start_method('spawn', force=True)
+                print("========1.1: Starting mp.spawn")
+                
+                ctx = mp.spawn(
+                    distributed_worker_function,  # Use global function instead of method
+                    args=(self.net, self.num_gpus, input_data, self.is_decoder, self.fast_mode),
+                    nprocs=self.num_gpus - 1,  # Main process handles rank 0
+                    join=False  # Don't block main process
+                )
+                print("========1.2: mp.spawn completed")
+            except Exception as e:
+                print(f"========1.ERROR: mp.spawn failed: {e}")
+                import traceback
+                traceback.print_exc()
+                # Fallback to single GPU
+                return super().vae_tile_forward(z)
         print("========2")
         # Main process executes rank 0 logic  
         result = self.execute_rank_0_processing(z, input_data, result_shape)
