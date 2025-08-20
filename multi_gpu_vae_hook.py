@@ -436,15 +436,23 @@ class DistributedVAEHook(VAEHook):
     
     def execute_rank_0_processing(self, z, input_data, result_shape):
         """Main process executes as rank 0 in distributed group"""
+        print("========2.1: Starting rank 0 processing")
+        
         # Initialize distributed environment as rank 0
-        dist.init_process_group(
-            backend='nccl',
-            init_method='env://',
-            rank=0,
-            world_size=self.num_gpus
-        )
+        try:
+            dist.init_process_group(
+                backend='nccl',
+                init_method='env://',
+                rank=0,
+                world_size=self.num_gpus
+            )
+            print("========2.2: Distributed group initialized")
+        except Exception as e:
+            print(f"========2.2 ERROR: Failed to init distributed group: {e}")
+            raise
         
         torch.cuda.set_device(0)
+        print("========2.3: CUDA device set")
         
         try:
             # Extract data
@@ -453,17 +461,21 @@ class DistributedVAEHook(VAEHook):
             in_bboxes = input_data['in_bboxes']
             out_bboxes = input_data['out_bboxes']
             is_decoder = input_data['is_decoder']
+            print("========2.4: Data extracted")
+            
+            # Load model replica on GPU 0 FIRST
+            import copy
+            net_replica = copy.deepcopy(self.net).to('cuda:0').eval()
+            print("========2.5: Model replica created")
             
             # Move input to GPU 0 and broadcast to all ranks
             z_gpu0 = z.to('cuda:0')  # Use original z instead of z_cpu
             dist.broadcast(z_gpu0, src=0)
+            print("========2.6: Tensor broadcast completed")
             
-            # Build task queue locally in rank 0
+            # Build task queue locally in rank 0 AFTER net_replica is defined
             task_queue_template = build_task_queue(net_replica, is_decoder)
-            
-            # Load model replica on GPU 0
-            import copy
-            net_replica = copy.deepcopy(self.net).to('cuda:0').eval()
+            print("========2.7: Task queue built")
             
             # Distribute tiles to rank 0
             tiles_for_rank0 = []
