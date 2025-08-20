@@ -340,6 +340,29 @@ class DistributedVAEHook(VAEHook):
                 mp.set_start_method('spawn', force=True)
                 print("========1.1: Starting mp.spawn")
                 
+                # Test serialization of each argument
+                try:
+                    import pickle
+                    print("========1.1.1: Testing argument serialization")
+                    pickle.dumps(self.num_gpus)
+                    print("========1.1.2: num_gpus serializable")
+                    pickle.dumps(input_data)
+                    print("========1.1.3: input_data serializable")
+                    pickle.dumps(self.is_decoder)
+                    print("========1.1.4: is_decoder serializable")
+                    pickle.dumps(self.fast_mode)
+                    print("========1.1.5: fast_mode serializable")
+                    pickle.dumps(z)
+                    print("========1.1.6: z serializable")
+                    # Don't test self.net yet - it's likely the problem
+                    print("========1.1.7: About to test network serialization")
+                    pickle.dumps(self.net)
+                    print("========1.1.8: network serializable")
+                except Exception as e:
+                    print(f"========1.1.ERROR: Serialization failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+                
                 # Spawn ALL workers (including what would be rank 0)
                 results = mp.spawn(
                     distributed_worker_function,  # Use global function instead of method
