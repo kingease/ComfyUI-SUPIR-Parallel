@@ -464,26 +464,41 @@ class DistributedVAEHook(VAEHook):
                     current_module_name = __name__
                     print(f"Current module __name__: {current_module_name}")
                     
-                    # Try to use the proper module name that child processes can import
-                    if current_module_name and not current_module_name.startswith('/'):
-                        # If we have a proper module name, use it
-                        distributed_worker_function.__module__ = current_module_name
-                        print(f"Using current module name: {current_module_name}")
+                    # Convert file path to proper Python module name
+                    if current_module_name.startswith('/'):
+                        # Extract from "ComfyUI-SUPIR-Parallel" onwards
+                        if 'ComfyUI-SUPIR-Parallel' in current_module_name:
+                            # Split at ComfyUI-SUPIR-Parallel
+                            parts = current_module_name.split('ComfyUI-SUPIR-Parallel')
+                            if len(parts) > 1:
+                                # Get the part after ComfyUI-SUPIR-Parallel (like ".multi_gpu_vae_hook")
+                                module_suffix = parts[1]
+                                if module_suffix.startswith('.'):
+                                    module_suffix = module_suffix[1:]  # Remove leading dot
+                                # Create proper module name
+                                proper_module_name = f"ComfyUI-SUPIR-Parallel.{module_suffix}"
+                                print(f"Converted to proper module: {proper_module_name}")
+                                distributed_worker_function.__module__ = proper_module_name
+                                
+                                # Add parent directory (custom_nodes) to sys.path
+                                import sys
+                                parent_dir = parts[0] + 'custom_nodes'  # Gets /workspace/.../custom_nodes
+                                if parent_dir not in sys.path:
+                                    sys.path.insert(0, parent_dir)
+                                print(f"Added parent to sys.path: {parent_dir}")
+                            else:
+                                print("Could not parse module path properly")
+                                # return super().vae_tile_forward(z)
+                        else:
+                            print("ComfyUI-SUPIR-Parallel not found in module name")
+                            # return super().vae_tile_forward(z)
                     else:
-                        # Fallback to a simple name
-                        distributed_worker_function.__module__ = 'multi_gpu_vae_hook'
-                        print(f"Using fallback module name: multi_gpu_vae_hook")
+                        print(f"Using existing module name: {current_module_name}")
+                        distributed_worker_function.__module__ = current_module_name
                     
                     # Test if this can be pickled
                     pickle.dumps(distributed_worker_function)
                     print("========1.1.10: function serializable")
-                    
-                    # Add current directory to environment for child processes
-                    import sys
-                    current_dir = os.path.dirname(os.path.abspath(__file__))
-                    if current_dir not in sys.path:
-                        sys.path.insert(0, current_dir)
-                    print(f"Added to sys.path: {current_dir}")
                 except Exception as e:
                     print(f"========1.1.ERROR: Serialization failed: {e}")
                     import traceback
